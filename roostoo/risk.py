@@ -230,7 +230,10 @@ class PositionBook:
             if not self.path or not self.path.is_file():
                 return False
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-            return bool((payload or {}).get("positions"))
+            return (
+                not isinstance(payload, dict)
+                or bool(payload.get("positions"))
+            )
         except Exception:
             # Unreadable or corrupt: treat it as non-empty so we never clobber it.
             return True
@@ -268,8 +271,25 @@ class PositionBook:
         except Exception as exc:
             log.error("could not read position book (%s); starting flat", exc)
             return False
+                rows = (
+            payload.get("positions", {})
+            if isinstance(payload, dict)
+            else None
+        )
+        if not isinstance(rows, dict):
+            backup = self.path.with_name(
+                self.path.name + ".corrupt-" + uuid.uuid4().hex
+            )
+            with backup.open("xb") as dest:
+                dest.write(self.path.read_bytes())
+            log.error(
+                "invalid position book structure; preserved at %s",
+                backup,
+            )
+            return False
+
         self.positions = {}
-        for pair, row in (payload.get("positions") or {}).items():
+        for pair, row in rows.items():
             self.positions[pair] = Position(
                 pair=pair,
                 quantity=float(row.get("quantity", 0.0)),
