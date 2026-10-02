@@ -689,22 +689,26 @@ class RiskManager:
             # exit here *and* every exit in the execution layer, which refused to
             # sell without a usable price. The position became permanently stuck,
             # including for the kill switch.
+                        time_exit = None
             if self.cfg.max_hold_bars and position.opened_ts_ms:
-                held = now_bar - bar_index(position.opened_ts_ms, self.cfg.bar_seconds)
+                held = now_bar - bar_index(
+                    position.opened_ts_ms, self.cfg.bar_seconds
+                )
                 if held >= int(self.cfg.max_hold_bars):
-                    out.append(
-                        Signal(
-                            pair,
-                            EXIT_SHORT if position.is_short else EXIT_LONG,
-                            reason=f"time stop: held {held} bars >= {self.cfg.max_hold_bars}",
-                            meta={"trigger": "time_stop", "bars_held": held},
-                        )
+                    time_exit = Signal(
+                        pair,
+                        EXIT_SHORT if position.is_short else EXIT_LONG,
+                        reason=f"time stop: held {held} bars >= {self.cfg.max_hold_bars}",
+                        meta={"trigger": "time_stop", "bars_held": held},
                     )
-                    continue
 
             if not (mark > 0) or not math.isfinite(mark):
                 # No usable mark and the time stop has not fired yet. Nothing can
                 # be evaluated from here, but say so rather than silence.
+                if time_exit is not None:
+                    out.append(time_exit)
+                    continue
+                    
                 log.warning(
                     "%s: no usable mark (mark_price=%r); cannot evaluate the stop this loop",
                     pair,
@@ -757,6 +761,9 @@ class RiskManager:
                         )
                     )
                     continue
+
+            if time_exit is not None:
+                out.append(time_exit)
 
         return out
 
