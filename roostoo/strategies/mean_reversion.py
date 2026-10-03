@@ -12,6 +12,20 @@ Rule 2, restated precisely::
 
 Rule 3: only take those entries when ``ADX(14) < 25``.
 
+``direction`` selects which side of the mean we buy, and it moves the EXITS with
+the entries -- the two must agree, or the Z-exit silently never fires and every
+position dies on its stop instead:
+
+  ``momentum`` (default)   long a stretch UP,    exit when Z returns to -0.25
+                           short a stretch DOWN,  exit when Z returns to +0.25
+  ``reversion``            long a stretch DOWN,  exit when Z returns to -0.25
+                           short a stretch UP,    exit when Z returns to +0.25
+
+The rulebook text for the long clause reads *"Z[t-1] >= X and Delta Z < 0"*,
+which is the fade-a-rally setup, so its *level* matches ``momentum`` and its
+*confirmation sign* matches ``reversion``; the text is ambiguous and the team
+resolved it in favour of momentum, measured (docs/FINDINGS.md section 9).
+
 Two notes on the specification as written.
 
 1. The team's text says *"Long Entry when Z[t-1] >= X and Delta Z < 0"* for the
@@ -61,6 +75,16 @@ class MeanReversionStrategy(Strategy):
             "z_exit_long": -0.25,
             "z_exit_short": 0.25,
             "require_turn": True,  # Delta Z confirmation
+            #: Minimum |dZ| for the turn confirmation. 0.0 reproduces the
+            #: historical "any move in the entry's direction" test.
+            "min_delta_z": 0.0,
+            #: "momentum" (the shipped policy) rides the deviation; "reversion"
+            #: fades it. Both the entries and the exits follow this switch, and
+            #: they must agree or the Z-exit never fires.
+            #: 8 pairs x 120 days, costs and stops included (FINDINGS section 9):
+            #:   reversion  IS -6.06%  OOS -4.22%  dd 6.28%  104 round trips
+            #:   momentum   IS -2.20%  OOS -0.55%  dd 2.50%   37 round trips
+            "direction": "momentum",
             # --- Rule 3 -----------------------------------------------------
             "adx_period": 14,
             "adx_max": 25.0,
@@ -133,6 +157,10 @@ class MeanReversionStrategy(Strategy):
         signals.extend(self._entries(ctx, need))
         return signals
 
+    def _momentum(self) -> bool:
+        """True when the deviation is taken as continuation rather than a fade."""
+        return str(self.params.get("direction", "momentum")).strip().lower() != "reversion"
+
     # ------------------------------------------------------------------
     def _exits(self, ctx: MarketContext, need: int) -> list[Signal]:
         out: list[Signal] = []
@@ -151,25 +179,36 @@ class MeanReversionStrategy(Strategy):
             series = ctx.series(pair)
             atr_value = ind.atr_wilder(ctx.highs(pair), ctx.lows(pair), closes, int(self.params["atr_period"]))
 
+            momentum = self._momentum()
             if position.is_short:
-                if z <= float(self.params["z_exit_short"]):
+                exit_now = (z >= float(self.params["z_exit_short"]) if momentum
+                            else z <= float(self.params["z_exit_short"]))
+                if exit_now:
                     out.append(
                         Signal(
                             pair,
                             EXIT_SHORT,
-                            reason=f"Z {z:+.2f} <= {self.params['z_exit_short']:+.2f} (mean reached)",
+                            reason=(
+                                f"Z {z:+.2f} {'>=' if momentum else '<='} "
+                                f"{self.params['z_exit_short']:+.2f} (mean reached)"
+                            ),
                             meta=self._meta(pair, z, None, None, atr_value, series),
                         )
                     )
                 else:
                     self.note(pair, short_exit_held_for=f"Z {z:+.2f}")
             else:
-                if z >= float(self.params["z_exit_long"]):
+                exit_now = (z <= float(self.params["z_exit_long"]) if momentum
+                            else z >= float(self.params["z_exit_long"]))
+                if exit_now:
                     out.append(
                         Signal(
                             pair,
                             EXIT_LONG,
-                            reason=f"Z {z:+.2f} >= {self.params['z_exit_long']:+.2f} (mean reached)",
+                            reason=(
+                                f"Z {z:+.2f} {'<=' if momentum else '>='} "
+                                f"{self.params['z_exit_long']:+.2f} (mean reached)"
+                            ),
                             meta=self._meta(pair, z, None, None, atr_value, series),
                         )
                     )
@@ -245,11 +284,19 @@ class MeanReversionStrategy(Strategy):
                 continue
 
             # --- Rule 2: the entry itself ------------------------------
-            long_trigger = z_prev <= -z_entry
-            short_trigger = z_prev >= z_entry
+            # `direction` chooses which side of the mean we buy. `min_delta_z`
+            # is the turn confirmation: the Z move must be at least this large
+            # in the entry's direction. 0.0 reproduces the historical test.
+            if self._momentum():
+                long_trigger = z_prev >= z_entry
+                short_trigger = z_prev <= -z_entry
+            else:
+                long_trigger = z_prev <= -z_entry
+                short_trigger = z_prev >= z_entry
+            min_dz = float(self.params.get("min_delta_z", 0.0) or 0.0)
             if self.params["require_turn"]:
-                long_trigger = long_trigger and delta_z > 0
-                short_trigger = short_trigger and delta_z < 0
+                long_trigger = long_trigger and delta_z > min_dz
+                short_trigger = short_trigger and delta_z < -min_dz
 
             meta = self._meta(pair, z_now, z_prev, adx_value, atr_value, ctx.series(pair))
             meta["deviation"] = deviation

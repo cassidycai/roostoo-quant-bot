@@ -354,3 +354,51 @@ confirm the real rate in the live journal before relying on it.
   0.5% for the same reason — a gap that large is a wrong symbol (USDT vs USD) or a
   stale feed, not a related market. Note this check **fails open** (a Binance
   outage must not stop trading), unlike the depth check, which fails closed.
+
+## 9. Direction: momentum beats reversion
+
+Rule 2's entry can be read two ways, and the code now makes the choice explicit
+through `direction` instead of leaving it implicit in a sign.
+
+**The repo's own `data/` is only ~120 days, which is too short to settle this.**
+The table below uses a 2-year dataset (35,042 x 30m bars, 10 pairs) and holds out
+the final 183 days, so the out-of-sample column is comparable across rows.
+
+| policy | IS | OOS (183 days) | IS drawdown | round trips (IS/OOS) |
+|---|---|---|---|---|
+| reversion, shipped defaults | -19.65% | -13.72% | 19.85% | 315 / 498 |
+| reversion + the team's `.env` | -19.85% | **-19.25%** | 19.97% | 488 / 317 |
+| **momentum + the team's `.env`** | -19.32% | **-2.51%** | 19.71% | 310 / 145 |
+| **momentum + stricter entry params** | +2.65% | **-1.51%** | **3.05%** | 57 / 31 |
+
+`run_backtest.py --data-dir <2yr> --oos-frac 0.25`.
+
+**Momentum beats reversion by 11-17 percentage points out of sample**, with about
+a fifth of the drawdown, and stricter entry parameters (`z_entry 2.8`,
+`adx_max 20`, `min_abs_deviation 0.012`) are worth roughly another 1pp against
+the looser `.env` values.
+
+Three things this does **not** say:
+
+* **It is not profitable.** The best out-of-sample cell is -1.51% over 183 days.
+  Momentum turns a large loss into a small one; it does not produce a gain.
+* **It trades too little to comply.** That best cell makes 31 round trips in 183
+  days -- about 2 in a 14-day window, against a requirement of 8 active trading
+  days. The configurations that trade enough (145-317 round trips) lose more.
+* **Magnitudes do not transfer between datasets.** On the repo's own 120-day data
+  this same comparison reads -0.55% vs -4.22%; on 2 years it reads -2.51% vs
+  -19.25%. Only the *ordering* is stable. That is why the team needs one shared,
+  fingerprinted dataset: `data/*.csv` is gitignored, so every member currently
+  backtests against a different history. A single month of this strategy was
+  measured at +4.30% while the two-year out-of-sample result is -1.51%.
+
+Two mechanics worth keeping:
+
+* **The entry and the exit must move together.** A momentum long enters at
+  `Z >= +2.8` and can only leave through the Z-exit when `Z <= -0.25` -- a swing
+  of more than three sigma through the entire distribution. Ship one without the
+  other and the Z-exit silently never fires; positions die on the stop instead.
+  That is why `direction` drives both.
+* The ATR stop **helps** momentum (-0.55% OOS with it, -1.16% without, on the
+  120-day set) while it **hurt** reversion (section 2). The sign of that result
+  depends on the direction, so an exit finding must not be carried across.
