@@ -30,6 +30,7 @@ Execution model, chosen to avoid the usual ways a backtest lies to you:
 """
 
 from __future__ import annotations
+from .strategies.scoring import execution_terms
 
 import logging
 import math
@@ -503,6 +504,30 @@ class Backtester:
             ts_ms = ts
 
         if action.action == ENTER_LONG:
+            if "scoring_version" in action.meta:
+                rejection, terms = execution_terms(
+                    self.cfg, action.meta, reference=reference_price,
+                    spread_bps=self.assumed_spread_bps,
+                    stop_price=action.stop_price, now_ms=ts_ms,
+                )
+                if rejection:
+                    self.rejections[rejection] += 1
+                    return
+                # A next-open gap can change stop risk. Shrink, never enlarge,
+                # the approved quantity using the current NAV and fixed stop.
+                fill_price = reference_price * (1.0 + slip)
+                stop_loss = fill_price - action.stop_price
+                nav_now = portfolio_nav(self.cash_usd, self.book.held())
+                loss_per_unit = stop_loss + fill_price * terms["cost_pct"]
+                quantity_cap = nav_now * terms["risk_per_trade_pct"] / loss_per_unit
+                action.quantity = min(action.quantity, quantity_cap)
+                action.notional = action.quantity * fill_price
+                action.risk_amount = action.quantity * loss_per_unit
+                action.meta.update(terms)
+                if action.notional < self.cfg.min_order_notional:
+                    self.rejections["scored fill below minimum notional"] += 1
+                    return
+                  
             price = reference_price * (1.0 + slip)
             quantity = self._clamp_quantity(action.quantity, price, self.cash_usd)
             if quantity <= 0:
