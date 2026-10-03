@@ -36,7 +36,12 @@ import scan_secrets  # noqa: E402  (deliberately after the sys.path fix-up)
 import check_encoding  # noqa: E402  (same: it lives in scripts/)
 
 from roostoo.config import Config  # noqa: E402
-from roostoo.engine import TradingEngine  # noqa: E402
+from roostoo.engine import (  # noqa: E402
+    ORDER_FILLED,
+    ORDER_NOT_FILLED,
+    ORDER_UNKNOWN,
+    TradingEngine,
+)
 from roostoo.models import (  # noqa: E402
     ExchangeInfo,
     OrderResult,
@@ -242,16 +247,32 @@ class FlakyStartupClient:
 class TestFailedStartupIsNonDestructive(unittest.TestCase):
     """The bug this pins: a startup blip used to erase the whole book."""
 
-    def test_run_failure_leaves_the_stored_state_untouched(self) -> None:
-        with scratch_dir() as d:
-            book_path = d / "positions.json"
-            state_path = d / "engine_state.json"
-            write_book(book_path, {PAIR: book_fixture()})
-            write_state(state_path)
-            book_before = book_path.read_bytes()
-            state_before = state_path.read_bytes()
+    @staticmethod
+    def _live_config(directory: Path) -> Config:
+        """Live, because an unstamped legacy file is only migrated by the live
+        runtime -- a mock run deliberately leaves it alone."""
+        cfg = make_config(directory)
+        cfg.mock = False
+        return cfg
 
-            engine = TradingEngine(make_config(d), client=FlakyStartupClient())
+    def test_run_failure_leaves_the_stored_state_untouched(self) -> None:
+        """The bug this pins: a startup blip used to erase the whole book.
+
+        The fixtures go to the *legacy* location on purpose, so this also covers the
+        upgrade path: bootstrap migrates them into the per-mode directory before
+        anything can fail on the network, and a failure after that must leave them
+        exactly as they were.
+        """
+        with scratch_dir() as d:
+            legacy_book = d / "positions.json"
+            legacy_state = d / "engine_state.json"
+            write_book(legacy_book, {PAIR: book_fixture()})
+            write_state(legacy_state)
+            book_before = legacy_book.read_bytes()
+            state_before = legacy_state.read_bytes()
+
+            engine = TradingEngine(self._live_config(d), client=FlakyStartupClient())
+            scoped = d / engine.cfg.state_dir_name
             try:
                 engine.run(max_cycles=1)
                 self.fail("run() should have propagated the startup failure")
@@ -261,8 +282,16 @@ class TestFailedStartupIsNonDestructive(unittest.TestCase):
                 # Exactly what run_live.py does from its `finally:` block.
                 engine.shutdown(flatten=False)
 
-            self.assertEqual(book_path.read_bytes(), book_before, "the position book was wiped by a failed startup")
-            self.assertEqual(state_path.read_bytes(), state_before, "the risk state was reset by a failed startup")
+            self.assertEqual(
+                (scoped / "positions.json").read_bytes(),
+                book_before,
+                "the migrated position book was wiped by a failed startup",
+            )
+            self.assertEqual(
+                (scoped / "engine_state.json").read_bytes(),
+                state_before,
+                "the migrated risk state was reset by a failed startup",
+            )
 
     def test_the_kill_switch_survives_a_failed_startup(self) -> None:
         """`halted` must not be cleared by a blip: that would un-halt a halted bot."""
@@ -270,7 +299,7 @@ class TestFailedStartupIsNonDestructive(unittest.TestCase):
             write_book(d / "positions.json", {PAIR: book_fixture()})
             write_state(d / "engine_state.json")
 
-            engine = TradingEngine(make_config(d), client=FlakyStartupClient())
+            engine = TradingEngine(self._live_config(d), client=FlakyStartupClient())
             try:
                 engine.run(max_cycles=1)
             except RuntimeError:
@@ -278,7 +307,9 @@ class TestFailedStartupIsNonDestructive(unittest.TestCase):
             finally:
                 engine.shutdown(flatten=False)
 
-            restored = json.loads((d / "engine_state.json").read_text(encoding="utf-8"))
+            restored = json.loads(
+                (d / engine.cfg.state_dir_name / "engine_state.json").read_text(encoding="utf-8")
+            )
             self.assertTrue(restored["risk"]["halted"])
             self.assertEqual(restored["risk"]["peak_nav"], 123_456.0)
             self.assertEqual(restored["risk"]["last_exit_bar"], {"ETH/USD": 41})
@@ -287,8 +318,11 @@ class TestFailedStartupIsNonDestructive(unittest.TestCase):
         with scratch_dir() as d:
             engine = TradingEngine(make_config(d), client=FlakyStartupClient())
             engine._persist()
+            scoped = d / engine.cfg.state_dir_name
             self.assertFalse((d / "positions.json").exists())
             self.assertFalse((d / "engine_state.json").exists())
+            self.assertFalse((scoped / "positions.json").exists())
+            self.assertFalse((scoped / "engine_state.json").exists())
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +698,69 @@ class TestStateScopeIsolation(unittest.TestCase):
             book = PositionBook(path, cfg=cfg)
             self.assertFalse(book.load())
             self.assertEqual(book.positions, {})
+
+    def test_a_legacy_file_with_matching_provenance_is_migrated(self) -> None:
+        """The upgrade path: state used to live in JOURNAL_DIR itself. Moving it into
+        a per-mode directory must not present an upgrade as a first run."""
+        with scratch_dir() as d:
+            self._write_scoped(d / "positions.json", {"mode": "mock", "venue": Config().base_url})
+            engine = make_engine(d, _StatefulClient())
+            self.addCleanup(engine.journal.close)
+
+            engine._migrate_legacy_state()
+
+            migrated = engine._state_dir() / "positions.json"
+            self.assertTrue(migrated.is_file(), "the legacy book was not migrated")
+            self.assertTrue(
+                (d / "positions.json.pre-migration").is_file(), "no backup was kept"
+            )
+
+    def test_a_legacy_file_from_another_runtime_is_not_migrated(self) -> None:
+        """Provenance we cannot confirm is left alone and reported. Adopting another
+        venue's stops would be worse than refusing."""
+        with scratch_dir() as d:
+            legacy = d / "positions.json"
+            self._write_scoped(legacy, {"mode": "live", "venue": "https://elsewhere.example.com"})
+            before = legacy.read_bytes()
+            engine = make_engine(d, _StatefulClient())  # mock
+            self.addCleanup(engine.journal.close)
+
+            engine._migrate_legacy_state()
+
+            self.assertEqual(legacy.read_bytes(), before, "another runtime's state was taken")
+            self.assertFalse((engine._state_dir() / "positions.json").exists())
+
+    def test_an_unstamped_legacy_file_is_migrated_by_a_live_run(self) -> None:
+        """State written before stamping existed has no provenance to check, and the
+        live runtime is the presumptive owner, so it is adopted -- that is the whole
+        point of the migration."""
+        with scratch_dir() as d:
+            write_book(d / "positions.json", {PAIR: book_fixture()})
+            cfg = make_config(d)
+            cfg.mock = False
+            engine = TradingEngine(cfg, client=_StatefulClient())
+            self.addCleanup(engine.journal.close)
+
+            engine._migrate_legacy_state()
+
+            self.assertTrue((engine._state_dir() / "positions.json").is_file())
+
+    def test_a_mock_run_does_not_claim_unstamped_legacy_state(self) -> None:
+        """Migrating is destructive -- the original is moved -- so a simulator run
+        must not take state it may not own. Smoke-testing in mock first would
+        otherwise carry the live book into journal/mock/ and the next live start
+        would find nothing."""
+        with scratch_dir() as d:
+            legacy = d / "positions.json"
+            write_book(legacy, {PAIR: book_fixture()})
+            before = legacy.read_bytes()
+            engine = make_engine(d, _StatefulClient())  # mock
+            self.addCleanup(engine.journal.close)
+
+            engine._migrate_legacy_state()
+
+            self.assertEqual(legacy.read_bytes(), before, "a mock run took the legacy state")
+            self.assertFalse((engine._state_dir() / "positions.json").exists())
 
     def test_the_matching_scope_loads(self) -> None:
         with scratch_dir() as d:
@@ -1133,7 +1230,11 @@ class TestUnknownOrderReconciliationDoesNotInventFills(unittest.TestCase):
         with scratch_dir() as d:
             engine = make_engine(d, _StatefulClient(order_rows=[row]))
             self.addCleanup(engine.journal.close)
-            self.assertIsNone(engine._reconcile_unknown_order(self._action(), self._unknown(), int(time.time() * 1000)))
+            outcome, resolved = engine._reconcile_unknown_order(
+                self._action(), self._unknown(), int(time.time() * 1000)
+            )
+            self.assertEqual(outcome, ORDER_UNKNOWN)
+            self.assertIsNone(resolved)
             engine._record_result(self._unknown(), self._action(), int(time.time() * 1000), 1)
             self.assertEqual(engine.book.positions, {}, "a row with no Status produced a phantom position")
 
@@ -1142,7 +1243,23 @@ class TestUnknownOrderReconciliationDoesNotInventFills(unittest.TestCase):
         with scratch_dir() as d:
             engine = make_engine(d, _StatefulClient(order_rows=[row]))
             self.addCleanup(engine.journal.close)
-            self.assertIsNone(engine._reconcile_unknown_order(self._action(), self._unknown(), int(time.time() * 1000)))
+            outcome, resolved = engine._reconcile_unknown_order(
+                self._action(), self._unknown(), int(time.time() * 1000)
+            )
+            self.assertEqual(outcome, ORDER_UNKNOWN, "another order's cancellation is not ours")
+            self.assertIsNone(resolved)
+
+    def test_our_own_cancellation_releases_the_intent(self) -> None:
+        """A terminal, non-filled status settles the question. Holding the intent for
+        ever is its own failure mode: it reserves capital and blocks a halt."""
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient(order_rows=[self._row(Status="CANCELED", FilledQuantity=0.0)]))
+            self.addCleanup(engine.journal.close)
+            outcome, resolved = engine._reconcile_unknown_order(
+                self._action(), self._unknown(), int(time.time() * 1000)
+            )
+            self.assertEqual(outcome, ORDER_NOT_FILLED)
+            self.assertIsNone(resolved)
 
     def test_a_filled_status_with_no_quantity_is_not_booked(self) -> None:
         row = self._row(FilledQuantity=0.0)
@@ -1228,34 +1345,51 @@ class TestUnknownOrderKeepsItsStop(unittest.TestCase):
             "BTC": WalletBalance(asset="BTC", free=coin_free, locked=0.0),
         }
 
-    def test_an_unresolved_order_is_remembered_with_its_stop(self) -> None:
+    def test_the_intent_is_on_disk_before_the_order_is_sent(self) -> None:
+        """This is what closes the crash window. `_persist` only runs at the end of
+        a cycle, so an intent recorded after the fact is an intent a crash can lose
+        -- and the fill would then be adopted with no stop."""
         with scratch_dir() as d:
             engine = make_engine(d, UnknownOrderClient())
             self.addCleanup(engine.journal.close)
-            engine._record_result(self._unknown(), self._action(), int(time.time() * 1000), 1)
+
+            self.assertTrue(engine._write_intent(self._action(), int(time.time() * 1000)))
 
             intent = engine._unknown_intents.get(PAIR)
-            self.assertIsNotNone(intent, "an unresolved order was dropped on the floor")
+            self.assertIsNotNone(intent, "no intent was recorded")
             self.assertEqual(intent["stop_price"], 57_000.0)
             self.assertEqual(intent["side"], "BUY")
+            self.assertTrue(
+                engine._intent_path(PAIR).is_file(),
+                "the intent was not durable before the order would have been sent",
+            )
 
     def test_the_intent_survives_a_restart(self) -> None:
-        """A transport failure is exactly when the process gets restarted before
-        the venue can be asked again."""
+        """A transport failure is exactly when the process gets restarted before the
+        venue can be asked again."""
         with scratch_dir() as d:
             engine = make_engine(d, UnknownOrderClient())
-            engine._ready = True
-            engine._record_result(self._unknown(), self._action(), int(time.time() * 1000), 1)
-            self.assertIn(PAIR, engine._unknown_intents)
-            engine._persist()
+            self.assertTrue(engine._write_intent(self._action(), int(time.time() * 1000)))
             engine.journal.close()
 
             revived = make_engine(d, UnknownOrderClient())
             self.addCleanup(revived.journal.close)
-            revived._load_risk_state()
+            revived._load_unknown_intents()
 
             self.assertIn(PAIR, revived._unknown_intents, "a restart forgot the order")
             self.assertEqual(revived._unknown_intents[PAIR]["stop_price"], 57_000.0)
+
+    def test_a_settled_order_forgets_its_intent(self) -> None:
+        with scratch_dir() as d:
+            engine = make_engine(d, UnknownOrderClient())
+            self.addCleanup(engine.journal.close)
+            engine._write_intent(self._action(), int(time.time() * 1000))
+            self.assertTrue(engine._intent_path(PAIR).is_file())
+
+            engine._forget_intent(PAIR, int(time.time() * 1000), "test")
+
+            self.assertNotIn(PAIR, engine._unknown_intents)
+            self.assertFalse(engine._intent_path(PAIR).is_file(), "the intent file outlived its order")
 
     def test_a_late_retry_still_matches_the_original_send_time(self) -> None:
         """The history query only accepts a row created near the request, so a
@@ -1276,15 +1410,14 @@ class TestUnknownOrderKeepsItsStop(unittest.TestCase):
             self.addCleanup(engine.journal.close)
 
             self.assertIsNone(
-                engine._reconcile_unknown_order(self._action(), self._unknown(), now),
+                engine._reconcile_unknown_order(self._action(), self._unknown(), now)[1],
                 "a ten-minute-old row must not match a now-anchored query",
             )
-            self.assertIsNotNone(
-                engine._reconcile_unknown_order(
-                    self._action(), self._unknown(), now, sent_ms=old_send
-                ),
-                "anchoring on the send time must find the row",
+            outcome, resolved = engine._reconcile_unknown_order(
+                self._action(), self._unknown(), now, sent_ms=old_send
             )
+            self.assertEqual(outcome, ORDER_FILLED, "anchoring on the send time must find the row")
+            self.assertIsNotNone(resolved)
 
     def test_the_remembered_stop_is_restored_when_the_holding_is_adopted(self) -> None:
         with scratch_dir() as d:
@@ -1626,6 +1759,8 @@ class HaltClient:
         self.pending_raises = False
         #: Orders the venue knows about but the local table may not.
         self.venue_pending: dict = {}
+        #: Whether a successful cancel actually removes it from the venue's list.
+        self.cancel_clears_pending = True
 
     def sync_time(self) -> int:
         return 0
@@ -1667,6 +1802,8 @@ class HaltClient:
         pair = kwargs.get("pair")
         if pair:
             self.cancelled.append(pair)
+            if self.cancel_clears_pending:
+                self.venue_pending.pop(pair, None)
         return []
 
     def short_positions(self) -> list:
@@ -1775,12 +1912,27 @@ class TestHaltDoesNotAbandonOpenPositions(unittest.TestCase):
                 engine._shutting_down, "the engine finished with an order it could not cancel"
             )
 
-    def test_a_venue_order_stops_the_halt_from_finishing(self) -> None:
-        """An order that survives in the venue but not in the local table is still
-        an order, and it is exactly what a restart leaves behind."""
+    def test_a_venue_only_order_is_cancelled_so_the_halt_can_finish(self) -> None:
+        """The reviewer's case: `_resting` is empty (it does not survive a restart)
+        but the venue still holds a buy order. It has to be *cancelled*, not merely
+        noticed -- otherwise the halt runs on while the order stays live."""
         with scratch_dir() as d:
             engine = self._engine(d, hold=False)
             engine.client.venue_pending = {PAIR: 1}
+            engine.step()
+
+            self.assertEqual(
+                engine.client.cancelled, [PAIR], "the venue-only order was never cancelled"
+            )
+            self.assertTrue(
+                engine._shutting_down, "with a genuinely clean account the halt may finish"
+            )
+
+    def test_an_order_the_venue_will_not_drop_keeps_the_halt_alive(self) -> None:
+        with scratch_dir() as d:
+            engine = self._engine(d, hold=False)
+            engine.client.venue_pending = {PAIR: 1}
+            engine.client.cancel_clears_pending = False  # the cancel does not take
             engine.step()
 
             self.assertFalse(

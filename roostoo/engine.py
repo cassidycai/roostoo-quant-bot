@@ -61,6 +61,18 @@ log = logging.getLogger(__name__)
 #: previous 2% allowance would have let a genuine USDT/USD mismatch through.
 SEED_TOLERANCE_PCT = 0.005
 
+#: Outcomes of `TradingEngine._reconcile_unknown_order`.
+#:
+#: ``ORDER_UNKNOWN`` must not be released: a row can be missing because the venue
+#: has not written it yet, and assuming "not found" means "not filled" is how a
+#: position arrives later with nothing protecting it.
+ORDER_FILLED = "filled"
+ORDER_NOT_FILLED = "not_filled"
+ORDER_UNKNOWN = "unknown"
+
+#: Venue statuses that settle an order as gone without a fill.
+TERMINAL_NOT_FILLED = frozenset({"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"})
+
 
 @dataclass
 class EngineStats:
@@ -157,6 +169,8 @@ class TradingEngine:
         # default-empty book and default risk state over the real ones -- losing
         # every stop level, cost basis and cooldown, resetting the drawdown
         # high-water mark, and silently clearing the kill switch.
+        self._migrate_legacy_state()
+        self._load_unknown_intents()
         self.book.load()
         self._load_risk_state()
 
@@ -323,7 +337,7 @@ class TradingEngine:
                 self.journal.halt(now_ms, self.risk.halt_reason, nav=round(nav, 4))
                 self._halt_announced = True
 
-            self._cancel_all_resting_orders(now_ms)
+            self._cancel_all_entry_orders(now_ms)
 
             if self.book.held():
                 self._flatten(now_ms, reason=self.risk.halt_reason)
@@ -665,13 +679,14 @@ class TradingEngine:
                 # with no Rule 5 stop at all -- and with the time stop disabled
                 # there is nothing else that would ever close it.
                 ticker = self.tickers.get(pair)
-                intent = self._unknown_intents.pop(pair, None)
+                intent = self._unknown_intents.get(pair)
                 remembered = (intent or {}).get("stop_price")
                 stop_price = (
                     float(remembered)
                     if isinstance(remembered, (int, float)) and remembered > 0
                     else None
                 )
+                self._forget_intent(pair, int(time.time() * 1000), "adopted from the exchange")
                 self.book.apply_spot_buy(
                     pair,
                     exchange_qty,
@@ -802,13 +817,14 @@ class TradingEngine:
         # A short created by an order whose outcome we never learned keeps the
         # stop that entry was approved with, for the same reason as the long path:
         # without it the position has no Rule 5 level at all.
-        intent = self._unknown_intents.pop(pair, None)
+        intent = self._unknown_intents.get(pair)
         remembered = (intent or {}).get("stop_price")
         stop_price = (
             float(remembered)
             if isinstance(remembered, (int, float)) and remembered > 0
             else None
         )
+        self._forget_intent(pair, now_ms, "adopted short from the exchange")
 
         self.book.apply_short_open(
             pair,
@@ -855,6 +871,15 @@ class TradingEngine:
     def _execute(self, actions: list[ApprovedAction], now_ms: int, current_bar: int) -> None:
         for action in actions:
             try:
+                if action.action in (ENTER_LONG, ENTER_SHORT):
+                    # Persist the intent BEFORE the request leaves. The crash window
+                    # is between sending and hearing back, and `_persist` only runs
+                    # at the end of the cycle -- so an intent recorded after the
+                    # fact is an intent a crash can lose, and the position it
+                    # created would then be adopted with no stop.
+                    if not self._write_intent(action, now_ms):
+                        self.stats.order_errors += 1
+                        continue
                 if action.action == ENTER_LONG:
                     self._enter_long(action, now_ms, current_bar)
                 elif action.action == ENTER_SHORT:
@@ -931,25 +956,41 @@ class TradingEngine:
             return
         self._record_result(result, action, now_ms, current_bar)
 
-    def _cancel_all_resting_orders(self, now_ms: int) -> None:
-        """Cancel every tracked entry order, ignoring the staleness timeout.
+    def _cancel_all_entry_orders(self, now_ms: int) -> None:
+        """Cancel every entry order: the local table first, then the venue's own.
 
         ``_expire_resting_orders`` only touches orders older than
-        ``LIMIT_ENTRY_TIMEOUT_BARS``. That is right during normal trading and wrong
-        on a halt: an order that is still fresh can still fill, and it must not
-        fill into an account nothing is watching any more.
+        ``LIMIT_ENTRY_TIMEOUT_BARS``, which is right during normal trading and wrong
+        on a halt: an order that is still fresh can still fill, and it must not fill
+        into an account nothing is watching any more.
+
+        The venue is asked as well, because ``_resting`` does not survive a restart.
+        An order only the venue knows about is still an order -- that is exactly the
+        leftover a restart leaves behind -- so cancelling by pair is the only way to
+        reach it. A cancel that fails leaves the order in play, and the halt stays
+        alive until the account is genuinely clean.
         """
-        for pair, (placed_bar, price) in list(self._resting.items()):
+        pairs = set(self._resting)
+        try:
+            total, by_pair = self.client.pending_count()
+        except Exception as exc:
+            # Do not pretend the list is empty: the local table is not the whole
+            # truth, so an unanswered query means "may still be orders".
+            log.error("could not list venue orders while halting (%s); will retry", exc)
+        else:
+            pairs |= {p for p, count in by_pair.items() if count and count > 0}
+
+        for pair in sorted(pairs):
             try:
                 self.client.cancel_order(pair=pair)
             except Exception as exc:
                 # Leave it tracked and try again next cycle. A cancel that failed
                 # must not be assumed to have happened.
                 log.warning("%s: could not cancel the resting bid while halting: %s", pair, exc)
-                self.journal.error("cancel", str(exc), ts_ms=now_ms, pair=pair, price=price)
+                self.journal.error("cancel", str(exc), ts_ms=now_ms, pair=pair)
                 continue
             self._resting.pop(pair, None)
-            self.journal.event("cancel", pair=pair, price=price, reason="halt")
+            self.journal.event("cancel", pair=pair, reason="halt")
 
     def _halt_outstanding(self) -> str:
         """What still prevents a halted engine from being finished ('' if nothing).
@@ -1019,15 +1060,8 @@ class TradingEngine:
             # entry was approved with -- and let `_reconcile_positions` adopt
             # whatever the venue turns out to hold, with its stop restored.
             self.stats.unknown_orders += 1
-            self._remember_unknown_intent(
-                pair=action.pair,
-                action=action.action,
-                side="SELL",
-                quantity=action.quantity,
-                notional=action.notional,
-                stop_price=action.stop_price,
-                now_ms=now_ms,
-            )
+            # The intent is already durable: `_execute` persisted it before calling
+            # this, so a crash from here still leaves the stop on disk.
             log.error("short_open %s transport failure (state UNKNOWN): %s", action.pair, exc)
             self.journal.error("execute", f"short_open transport failure: {exc}", ts_ms=now_ms, pair=action.pair)
             return
@@ -1141,22 +1175,18 @@ class TradingEngine:
         """Apply a spot order outcome to the book, reconciling UNKNOWNs."""
         if result.status == "UNKNOWN":
             self.stats.unknown_orders += 1
-            reconciled = self._reconcile_unknown_order(action, result, now_ms)
-            if reconciled is None:
-                # Still unknown. Remember the intent so it is retried on every
-                # later cycle and survives a restart. Dropping it here is what
-                # used to lose the stop: the order filled at the venue, the
-                # balance reconciliation adopted the position days later, and
-                # nothing remembered where the stop belonged.
-                expected = "BUY" if action.action == ENTER_LONG else "SELL"
-                self._remember_unknown_intent(
-                    pair=action.pair,
-                    action=action.action,
-                    side=expected,
-                    quantity=result.quantity or action.quantity,
-                    notional=action.notional,
-                    stop_price=action.stop_price,
-                    now_ms=now_ms,
+            outcome, reconciled = self._reconcile_unknown_order(action, result, now_ms)
+            if outcome == ORDER_NOT_FILLED:
+                self._forget_intent(action.pair, now_ms, "the venue reports it did not fill")
+                return
+            if outcome == ORDER_UNKNOWN:
+                # The intent is already durable: `_execute` wrote it *before*
+                # sending, which is the only way to cover a crash between the
+                # request leaving and the reply arriving. It stays on disk and is
+                # re-queried every cycle.
+                log.error(
+                    "%s: outcome still unknown; the intent is on disk and retried each cycle",
+                    action.pair,
                 )
                 return
             result = reconciled
@@ -1216,41 +1246,6 @@ class TradingEngine:
             result.commission, result.order_id, result.role, action.reason,
         )
 
-    def _remember_unknown_intent(
-        self,
-        *,
-        pair: str,
-        action: str,
-        side: str,
-        quantity: float,
-        notional: float,
-        stop_price: Optional[float],
-        now_ms: int,
-    ) -> None:
-        """Record an order whose outcome the venue has not revealed.
-
-        Keeping the *send* time matters as much as keeping the stop: the history
-        query only accepts a row created shortly before the request, so a retry
-        that anchored on "now" would never match and the intent would rot in the
-        file while the position it created traded unprotected.
-        """
-        previous = self._unknown_intents.get(pair) or {}
-        intent = {
-            "action": action,
-            "side": side,
-            "quantity": float(quantity or 0.0),
-            "notional": float(notional or 0.0),
-            "stop_price": float(stop_price) if (stop_price and stop_price > 0) else None,
-            "sent_ms": int(previous.get("sent_ms") or now_ms),
-            "attempts": int(previous.get("attempts") or 0),
-        }
-        self._unknown_intents[pair] = intent
-        self.journal.event("unknown_order_remembered", pair=pair, **intent)
-        log.error(
-            "%s: %s outcome still unknown; remembered (stop=%s) and re-queried each cycle",
-            pair, side, intent["stop_price"],
-        )
-
     def _resolve_unknown_intents(self, now_ms: int, current_bar: int) -> None:
         """Re-ask the venue about every order whose outcome is still unknown.
 
@@ -1279,15 +1274,26 @@ class TradingEngine:
                 err_msg="retry",
             )
             intent["attempts"] = int(intent.get("attempts") or 0) + 1
-            resolved = self._reconcile_unknown_order(
+            outcome, resolved = self._reconcile_unknown_order(
                 action, probe, now_ms, sent_ms=int(intent.get("sent_ms") or now_ms)
             )
-            if resolved is None:
+            if outcome == ORDER_UNKNOWN:
+                age_ms = now_ms - int(intent.get("sent_ms") or now_ms)
+                # An intent that can never be settled still holds its reserve, so make
+                # that visible instead of letting it sit there indefinitely. It is not
+                # released on a guess: only a terminal venue status does that.
+                if age_ms > 1_800_000 and intent["attempts"] % 10 == 1:
+                    log.error(
+                        "%s: order intent unresolved for %.0f minutes after %d attempts; it is "
+                        "still holding its reserve. Check the venue by hand.",
+                        pair,
+                        age_ms / 60_000.0,
+                        intent["attempts"],
+                    )
                 continue
-            del self._unknown_intents[pair]
-            self.journal.event(
-                "unknown_order_resolved", pair=pair, attempts=intent["attempts"]
-            )
+            self._forget_intent(pair, now_ms, f"resolved: {outcome}")
+            if outcome == ORDER_NOT_FILLED:
+                continue
             log.warning(
                 "%s: unresolved order settled after %d attempt(s)", pair, intent["attempts"]
             )
@@ -1297,7 +1303,7 @@ class TradingEngine:
 
     def _reconcile_unknown_order(
         self, action: ApprovedAction, result: OrderResult, now_ms: int, sent_ms: Optional[int] = None
-    ) -> Optional[OrderResult]:
+    ) -> tuple[str, Optional[OrderResult]]:
         """Did an UNKNOWN order actually land?
 
         Never re-send. Ask the order history instead: if an order for this pair
@@ -1318,7 +1324,7 @@ class TradingEngine:
         except Exception as exc:
             self.journal.reconciliation(now_ms, action.pair, "query_failed", {"error": str(exc)})
             log.error("cannot reconcile unknown order for %s: %s", action.pair, exc)
-            return None
+            return (ORDER_UNKNOWN, None)
 
         trade_pair = self.exchange_pairs.get(action.pair)
         # One lot, with the same half-lot slack the balance reconciliation uses.
@@ -1329,6 +1335,7 @@ class TradingEngine:
         # minutes later must still accept the row the original request created.
         cutoff = (sent_ms if sent_ms is not None else now_ms) - 120_000
         expected_side = "BUY" if action.action == ENTER_LONG else "SELL"
+        alive = False
         for row in rows:
             created = int(row.get("CreateTimestamp", 0) or 0)
             side = str(row.get("Side", "")).upper()
@@ -1337,24 +1344,54 @@ class TradingEngine:
             filled = float(row.get("FilledQuantity", 0.0) or 0.0)
             if created < cutoff or side != expected_side:
                 continue
-            if status != "FILLED":
-                # Cancelled, rejected or still resting: not evidence our order landed.
-                continue
             if quantity <= 0 or abs(quantity - action.quantity) > tolerance:
                 continue
-            if filled <= 0:
-                continue
-            self.journal.reconciliation(
-                now_ms,
-                action.pair,
-                "order_found",
-                {"order_id": row.get("OrderID"), "status": status, "filled": filled},
-            )
-            return OrderResult.from_api(
-                action.pair, expected_side, "MARKET", action.quantity, {"Success": True, "OrderDetail": row}
-            )
-        self.journal.reconciliation(now_ms, action.pair, "order_not_found", {"reason": result.err_msg})
-        return None
+            if status == "FILLED":
+                if filled <= 0:
+                    continue
+                self.journal.reconciliation(
+                    now_ms,
+                    action.pair,
+                    "order_found",
+                    {"order_id": row.get("OrderID"), "status": status, "filled": filled},
+                )
+                return (
+                    ORDER_FILLED,
+                    OrderResult.from_api(
+                        action.pair,
+                        expected_side,
+                        "MARKET",
+                        action.quantity,
+                        {"Success": True, "OrderDetail": row},
+                    ),
+                )
+            if status in TERMINAL_NOT_FILLED:
+                # A terminal state that is not a fill settles the question: the order
+                # is gone and no position will appear from it, so the intent and its
+                # reserve can be released. Holding it forever is its own failure mode,
+                # because an intent that can never settle also blocks a halt from
+                # ever finishing.
+                self.journal.reconciliation(
+                    now_ms, action.pair, "order_terminal_unfilled", {"status": status}
+                )
+                log.warning(
+                    "%s: the unknown order is %s at the venue; releasing its intent",
+                    action.pair,
+                    status,
+                )
+                return (ORDER_NOT_FILLED, None)
+            # PENDING, NEW, PARTIALLY_FILLED: the order is still alive, so the outcome
+            # is still unknown and the reserve has to stay.
+            alive = True
+        self.journal.reconciliation(
+            now_ms,
+            action.pair,
+            "order_alive" if alive else "order_not_found",
+            {"reason": result.err_msg},
+        )
+        # "Not found" is not "not filled": a row can be missing because the venue has
+        # not written it yet. Only a terminal status releases the reserve.
+        return (ORDER_UNKNOWN, None)
 
     def _flatten(self, now_ms: int, reason: str) -> None:
         actions = self.risk.flatten_all(self.book.held())
@@ -1402,12 +1439,166 @@ class TradingEngine:
         # Per mode, for the same reason as the position book: a stamp stops a file
         # being *read* across runtimes, a separate file stops it being *written*
         # over. See Config.state_dir_name.
-        return Path(self.cfg.journal_dir) / self.cfg.state_dir_name / "engine_state.json"
+        return self._state_dir() / "engine_state.json"
 
     def _scope_matches(self, saved: dict[str, Any]) -> bool:
         """Does a state file's stamp match this process? See Config.state_scope."""
         current = self.cfg.state_scope
         return all(saved.get(key) == current[key] for key in current)
+
+    def _state_dir(self) -> Path:
+        """Where this runtime's state lives: a per-mode subdirectory of JOURNAL_DIR."""
+        return Path(self.cfg.journal_dir) / self.cfg.state_dir_name
+
+    def _intent_dir(self) -> Path:
+        """One small file per unresolved order, written *before* it is sent."""
+        return self._state_dir() / "intents"
+
+    def _intent_path(self, pair: str) -> Path:
+        return self._intent_dir() / f"{pair.replace('/', '-')}.json"
+
+    def _migrate_legacy_state(self) -> None:
+        """Adopt state written before it lived in a per-mode directory.
+
+        State used to sit directly in JOURNAL_DIR. Moving it into
+        ``<journal_dir>/<mode>/`` -- so one runtime can never overwrite another's --
+        would otherwise make an upgrade look like a first run: the book would be
+        rebuilt by balance reconciliation with no cost basis and no stop, and a
+        persisted halt would be dropped silently. The halt is the one piece of state
+        that must never disappear without saying so.
+
+        A legacy file is adopted only when its provenance is absent (it predates
+        stamping) or matches this runtime. A file naming a different runtime is left
+        untouched and reported: it belongs to a deployment this process is not, and
+        guessing would be worse than refusing.
+        """
+        import json
+        import shutil
+
+        legacy_dir = Path(self.cfg.journal_dir)
+        target_dir = self._state_dir()
+        for name in ("positions.json", "engine_state.json"):
+            source = legacy_dir / name
+            target = target_dir / name
+            if not source.is_file() or target.exists():
+                continue
+            try:
+                payload = json.loads(source.read_text(encoding="utf-8"))
+            except Exception as exc:
+                log.error("legacy state %s is unreadable (%s); leaving it in place", source, exc)
+                self.journal.error("migrate", f"unreadable legacy state: {exc}", path=str(source))
+                continue
+            saved = payload.get("scope") if isinstance(payload, dict) else None
+            if isinstance(saved, dict) and not self._scope_matches(saved):
+                log.error(
+                    "legacy state %s belongs to %s@%s, not %s@%s; refusing to migrate it. "
+                    "Move it aside by hand if this deployment really is its owner.",
+                    source,
+                    saved.get("mode"),
+                    saved.get("venue"),
+                    self.cfg.state_scope["mode"],
+                    self.cfg.state_scope["venue"],
+                )
+                self.journal.error(
+                    "migrate", "legacy state belongs to another runtime", path=str(source)
+                )
+                continue
+            if saved is None and self.cfg.mock:
+                # Unstamped, so it could belong to either runtime -- and migrating is
+                # destructive (the original is moved). A simulator run must not claim
+                # state it may not own: smoke-testing in mock first would otherwise
+                # take the live book with it, and the next live start would find
+                # nothing. Leave it for the live run, or for a human.
+                log.warning(
+                    "legacy state %s has no provenance and this is a mock run; leaving it "
+                    "alone. Start live to migrate it, or move it by hand.",
+                    source,
+                )
+                continue
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                # Copy first so a crash mid-migration cannot lose the original.
+                shutil.copy2(source, source.with_name(source.name + ".pre-migration"))
+                source.replace(target)
+            except Exception as exc:
+                log.error("could not migrate %s (%s); it is untouched", source, exc)
+                continue
+            log.warning(
+                "migrated legacy state %s -> %s (backup kept as *.pre-migration)", source, target
+            )
+            self.journal.event("state_migrated", source=str(source), target=str(target))
+
+    def _load_unknown_intents(self) -> None:
+        """Restore order intents that were written before their orders were sent.
+
+        This is what closes the crash window: the intent is on disk *before* the
+        request leaves, so a process that dies between sending and hearing back
+        still knows what it sent and what stop it belonged with.
+        """
+        import json
+
+        directory = self._intent_dir()
+        if not directory.is_dir():
+            return
+        for path in sorted(directory.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                log.error("unreadable order intent %s (%s); leaving it in place", path, exc)
+                continue
+            pair = str(payload.get("pair") or "")
+            if not pair:
+                continue
+            self._unknown_intents[pair] = payload
+        if self._unknown_intents:
+            log.error(
+                "restored %d order intent(s) written before sending (%s); re-queried every cycle",
+                len(self._unknown_intents),
+                ", ".join(sorted(self._unknown_intents)),
+            )
+
+    def _write_intent(self, action: ApprovedAction, now_ms: int) -> bool:
+        """Persist an order intent *before* the order is sent. False means do not send.
+
+        An order the process cannot remember is an order whose fill may arrive with
+        no stop attached: the balance reconciliation would adopt the position and
+        nothing would know where the protective level belonged.
+        """
+        import json
+
+        pair = action.pair
+        previous = self._unknown_intents.get(pair) or {}
+        intent = {
+            "pair": pair,
+            "action": action.action,
+            "side": "BUY" if action.action == ENTER_LONG else "SELL",
+            "quantity": float(action.quantity or 0.0),
+            "notional": float(action.notional or 0.0),
+            "stop_price": float(action.stop_price) if (action.stop_price and action.stop_price > 0) else None,
+            "sent_ms": int(previous.get("sent_ms") or now_ms),
+            "attempts": int(previous.get("attempts") or 0),
+        }
+        path = self._intent_path(pair)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(intent, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:
+            log.error("could not persist the order intent for %s (%s); NOT sending", pair, exc)
+            self.journal.error("intent", f"could not persist intent: {exc}", ts_ms=now_ms, pair=pair)
+            return False
+        self._unknown_intents[pair] = intent
+        return True
+
+    def _forget_intent(self, pair: str, now_ms: int, why: str) -> None:
+        """Drop a pair's intent, in memory and on disk, once its order is settled."""
+        self._unknown_intents.pop(pair, None)
+        try:
+            self._intent_path(pair).unlink(missing_ok=True)
+        except Exception as exc:
+            log.error("could not remove the order intent for %s (%s)", pair, exc)
+        self.journal.event("intent_cleared", pair=pair, reason=why, ts_ms=now_ms)
 
     def _load_risk_state(self) -> None:
         path = self._state_path()
