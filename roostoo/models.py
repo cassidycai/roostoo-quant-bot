@@ -169,6 +169,13 @@ class Position:
     take_profit_price: Optional[float] = None
     peak_price: float = 0.0
     opened_ts_ms: int = 0
+    #: Venue order ids already applied to this position.
+    #:
+    #: The same fill can be presented twice -- the history query that resolves an
+    #: UNKNOWN order may find a fill that was already booked normally, and a restart
+    #: can replay it -- so applying is made idempotent by id rather than by hoping it
+    #: only happens once. A tuple keeps the dataclass free of mutable defaults.
+    applied_order_ids: tuple[str, ...] = ()
 
     @property
     def notional(self) -> float:

@@ -73,6 +73,15 @@ ORDER_UNKNOWN = "unknown"
 #: Venue statuses that settle an order as gone without a fill.
 TERMINAL_NOT_FILLED = frozenset({"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"})
 
+#: Longest gap tolerated between the end of a seed CSV and now, in bars.
+#:
+#: The strategy is a closed-bar strategy: its z-score compares the current close
+#: against a 48-bar window. Gluing a CSV whose last bar is older than that window
+#: onto the live feed leaves the whole window stale and the first signals read a
+#: distribution that no longer exists, so the seed is refused and the operator is
+#: told to re-fetch. A cold start is the better failure.
+SEED_MAX_GAP_BARS = 48
+
 
 @dataclass
 class EngineStats:
@@ -206,6 +215,36 @@ class TradingEngine:
         )
         self._ready = True
 
+    def _candle_series_problem(self, candles: list, now_ms: int) -> Optional[str]:
+        """Why this series is unfit to warm a closed-bar strategy, or None.
+
+        Three things disqualify it. A bar dated in the future, or one that has not
+        closed yet, would put a partially-formed candle into the indicator window.
+        A gap makes every window that spans it compare closes across missing time,
+        and a gap longer than the window itself leaves the warm-up entirely stale.
+        In each case a cold start is better than a seed that lies.
+        """
+        step_ms = self.cfg.bar_seconds * 1000
+        last = candles[-1]
+        if last.ts_ms > now_ms:
+            return "last bar is dated in the future"
+        closes_in_ms = last.ts_ms + step_ms - now_ms
+        if closes_in_ms > 0:
+            return f"last bar has not closed yet (closes in {closes_in_ms / 1000:.0f}s)"
+        gap_bars = (now_ms - (last.ts_ms + step_ms)) // step_ms
+        if gap_bars > SEED_MAX_GAP_BARS:
+            return (
+                f"history ends {gap_bars} bars ago, past the {SEED_MAX_GAP_BARS}-bar limit; "
+                "re-run fetch_history.py before restarting"
+            )
+        for previous, current in zip(candles, candles[1:]):
+            if current.ts_ms - previous.ts_ms != step_ms:
+                return (
+                    f"gap in the series at {previous.ts_ms} -> {current.ts_ms} "
+                    f"({(current.ts_ms - previous.ts_ms) // step_ms} bars)"
+                )
+        return None
+
     def seed_history(self) -> None:
         """Warm the indicators from CSV, but only if the feed agrees on price.
 
@@ -234,6 +273,11 @@ class TradingEngine:
                 continue
             if not candles:
                 self.journal.event("seed_skipped", pair=pair, reason="empty file")
+                continue
+            problem = self._candle_series_problem(candles, int(time.time() * 1000))
+            if problem is not None:
+                self.journal.event("seed_rejected", pair=pair, reason=problem)
+                log.warning("%s: refusing to seed: %s", pair, problem)
                 continue
             basis = ticker.mid / candles[-1].close - 1.0
             if abs(basis) > SEED_TOLERANCE_PCT:
@@ -871,15 +915,6 @@ class TradingEngine:
     def _execute(self, actions: list[ApprovedAction], now_ms: int, current_bar: int) -> None:
         for action in actions:
             try:
-                if action.action in (ENTER_LONG, ENTER_SHORT):
-                    # Persist the intent BEFORE the request leaves. The crash window
-                    # is between sending and hearing back, and `_persist` only runs
-                    # at the end of the cycle -- so an intent recorded after the
-                    # fact is an intent a crash can lose, and the position it
-                    # created would then be adopted with no stop.
-                    if not self._write_intent(action, now_ms):
-                        self.stats.order_errors += 1
-                        continue
                 if action.action == ENTER_LONG:
                     self._enter_long(action, now_ms, current_bar)
                 elif action.action == ENTER_SHORT:
@@ -909,6 +944,14 @@ class TradingEngine:
             return
 
         self.stats.orders_sent += 1
+        # Persist the intent *here*: after the local checks that can still abandon the
+        # order (a quantity below the venue minimum never becomes a request) and
+        # before it leaves. Writing it any earlier left a permanent intent behind for
+        # an order that was never sent -- reserving capital for ever and able to block
+        # a halt from finishing.
+        if not self._write_intent(action, now_ms):
+            self.stats.order_errors += 1
+            return
         result = self.client.place_order(action.pair, "BUY", trade_pair.round_qty(quantity), "MARKET")
         self.journal.order(now_ms, action.to_dict(), result=result)
         self._record_result(result, action, now_ms, current_bar)
@@ -945,6 +988,9 @@ class TradingEngine:
 
         self.stats.orders_sent += 1
         self.stats.orders_posted += 1
+        if not self._write_intent(action, now_ms):
+            self.stats.order_errors += 1
+            return
         result = self.client.place_order(
             action.pair, "BUY", trade_pair.round_qty(quantity), "LIMIT", price=price
         )
@@ -1125,6 +1171,9 @@ class TradingEngine:
                 quantity = float(fmt(quantity, trade_pair.amount_precision))
 
         self.stats.orders_sent += 1
+        if not self._write_intent(action, now_ms):
+            self.stats.order_errors += 1
+            return
         result = self.client.place_order(action.pair, "SELL", trade_pair.round_qty(quantity), "MARKET")
         self.journal.order(now_ms, action.to_dict(), result=result)
         self._record_result(result, action, now_ms, current_bar)
@@ -1194,6 +1243,8 @@ class TradingEngine:
         if result.status == "REJECTED":
             self.stats.order_errors += 1
             log.warning("%s %s rejected: %s", result.side, action.pair, result.err_msg)
+            # The order is settled and no position came of it, so its intent is done.
+            self._forget_intent(action.pair, now_ms, "the venue rejected it")
             return
         if result.status != "FILLED":
             # Resting limit order: no position change yet.
@@ -1234,13 +1285,36 @@ class TradingEngine:
             )
             return
         price = result.avg_fill_price or (action.price or 0.0)
+        # The venue's order id makes applying this fill idempotent. The intent retry
+        # reads the same history this result came from, and a restart can replay it,
+        # so "apply once" has to be a property of the book, not of the call order.
+        order_id = getattr(result, "order_id", None)
+        if self.book.has_applied(action.pair, order_id):
+            # The same venue fill, presented again -- by the intent retry, or by a
+            # restart replaying a fill whose intent was not cleared. Skipping the
+            # whole path keeps the position, the trade log and the counters
+            # single-counted; only the quantity was guarded before.
+            log.warning(
+                "%s: order %s was already booked; ignoring the replay", action.pair, order_id
+            )
+            self._forget_intent(action.pair, now_ms, "replay of an applied fill")
+            return
         if result.side == "BUY":
-            self.book.apply_spot_buy(action.pair, filled, price, now_ms, action.stop_price)
+            self.book.apply_spot_buy(
+                action.pair, filled, price, now_ms, action.stop_price, order_id=order_id
+            )
             self.stats.entries += 1
         else:
-            self.book.apply_spot_sell(action.pair, filled, price)
+            self.book.apply_spot_sell(action.pair, filled, price, order_id=order_id)
             self.stats.exits += 1
             self.risk.record_exit(action.pair, current_bar)
+        # Settled, so the intent has done its job -- and leaving it behind was what
+        # let the retry path book this same fill a second time and double the
+        # position. Save the book *before* dropping the intent: the other order
+        # loses the position entirely if the process dies in between, whereas this
+        # one is covered by the id marker above, so a replay is a no-op.
+        self.book.save()
+        self._forget_intent(action.pair, now_ms, "filled")
         self.journal.trade(
             now_ms, action.pair, action.action, result.side, filled, price,
             result.commission, result.order_id, result.role, action.reason,
@@ -1637,19 +1711,40 @@ class TradingEngine:
             self.risk.restore(risk_payload)
             last_bar = payload.get("last_decision_bar")
             self._last_decision_bar = int(last_bar) if last_bar is not None else None
+            # `unknown_intents` in the snapshot is a *legacy* field, from before
+            # intents had their own files. Those files are authoritative now, so this
+            # must not replace what `_load_unknown_intents` already read: doing that
+            # let a stale snapshot with an empty map erase a brand-new intent (and
+            # with it the stop), or resurrect an intent whose file had been deleted
+            # (replaying a settled order). Only a pair with no file at all is adopted.
             saved_intents = payload.get("unknown_intents")
-            if isinstance(saved_intents, dict):
-                self._unknown_intents = {
-                    str(pair): dict(intent)
-                    for pair, intent in saved_intents.items()
-                    if isinstance(intent, dict)
-                }
-                if self._unknown_intents:
-                    log.error(
-                        "restored %d unresolved order intent(s) (%s); they will be "
-                        "re-queried this cycle and their stops are kept until they are",
-                        len(self._unknown_intents),
-                        ", ".join(sorted(self._unknown_intents)),
+            if isinstance(saved_intents, dict) and not self._intent_dir().is_dir():
+                # One-time upgrade migration, and only when the file store has never
+                # been used (its directory is created on the first intent written).
+                # Once that directory exists, anything left in the snapshot is a
+                # settled or superseded record, and adopting it would resurrect an
+                # order that has already been dealt with.
+                for saved_pair, saved in saved_intents.items():
+                    saved_pair = str(saved_pair)
+                    if not isinstance(saved, dict) or saved_pair in self._unknown_intents:
+                        continue
+                    path = self._intent_path(saved_pair)
+                    if path.exists():
+                        continue
+                    migrated = {"pair": saved_pair, **saved}
+                    try:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        tmp = path.with_suffix(".tmp")
+                        tmp.write_text(json.dumps(migrated, indent=2), encoding="utf-8")
+                        tmp.replace(path)
+                    except Exception as exc:
+                        log.error(
+                            "could not migrate the snapshot intent for %s (%s)", saved_pair, exc
+                        )
+                        continue
+                    self._unknown_intents[saved_pair] = migrated
+                    log.warning(
+                        "migrated the snapshot intent for %s into its own file", saved_pair
                     )
         except Exception as exc:
             # A well-formed-JSON file with a wrong *type* in it used to abort
@@ -1688,7 +1783,9 @@ class TradingEngine:
                 # Orders the venue has not yet explained. Without this a restart
                 # forgets that an order may exist, and the position it created is
                 # later adopted with no stop.
-                "unknown_intents": self._unknown_intents,
+                # Deliberately NOT "unknown_intents": the intent files are the single
+            # authority. Writing them here too is what created two sources that
+            # could disagree; see the migration note in _load_risk_state.
                 "last_decision_bar": self._last_decision_bar,
                 "stats": self.stats.to_dict(),
                 "universe": list(self.universe),
