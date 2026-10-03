@@ -60,7 +60,11 @@ _EMPTY_IS_NORMAL = {
     PATH_PENDING_COUNT: "no pending order",
     PATH_QUERY_ORDER: "no order matched",
 }
-
+# Public endpoints whose successful responses do not contain a `Success` flag.
+_NO_SUCCESS_FLAG = {
+    PATH_SERVER_TIME,
+    PATH_EXCHANGE_INFO,
+}
 
 # ---------------------------------------------------------------------------
 # Pure signing helpers (unit-tested against the published vector)
@@ -315,16 +319,18 @@ class RoostooClient:
             raise TransportError(f"{path} returned non-JSON payload: {text[:300]!r}") from exc
         if not isinstance(payload, dict):
             raise TransportError(f"{path} returned unexpected payload type {type(payload).__name__}")
-        if not _is_success(payload):
+        if path not in _NO_SUCCESS_FLAG and not _is_success(payload):
             err_msg = str(payload.get("ErrMsg", "unknown error") or "unknown error")
             if "Success" not in payload:
                 err_msg = "response carried no Success flag"
+         
             empty_token = _EMPTY_IS_NORMAL.get(path)
             if empty_token and empty_token in err_msg.lower():
                 # Documented empty state, not an error.
                 return payload
-            raise APIError(err_msg, path, payload)
-        return payload
+         
+          raise APIError(err_msg, path, payload)
+              return payload
 
     @property
     def request_count(self) -> int:
