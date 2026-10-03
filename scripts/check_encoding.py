@@ -4,19 +4,22 @@
 This repository is written on Windows and read on Linux and GitHub. A PowerShell
 pipeline such as ``Get-Content -Raw x.md | Set-Content x.md -Encoding utf8``
 decodes UTF-8 as the machine's ANSI codepage (cp936/GBK on a Chinese Windows) and
-re-encodes the result, so every ``—`` becomes ``鈥?``, a BOM appears at the top of
-the file, and no tool reports an error. That happened once; this script is what
-stops it happening again.
+re-encodes the result, so every em dash becomes the two-character sequence
+U+9225 U+003F, a BOM appears at the top of the file, and no tool reports an error.
+That happened once; this script is what stops it happening again.
 
 Two checks, both fatal:
 
 * **No UTF-8 BOM.** Markdown, YAML, Python and ``.example`` files in this repo
   have never carried one, and Git for Windows tooling does not add them.
 * **No mojibake.** Characters are exhausted against an allowlist of scripts the
-  docs legitimately use (ASCII, Latin-1 punctuation, Greek for the σ/Δ maths,
-  CJK for the Chinese quick-start, and the fullwidth forms that section needs).
-  Anything outside those ranges -- a stray ``鈥``, a Private Use Area codepoint --
-  is a double-encoding artefact.
+  docs legitimately use (ASCII, Latin-1 punctuation, Greek for the sigma/delta
+  maths, general punctuation, arrows, mathematical operators, box drawing, CJK and
+  the fullwidth forms). Anything outside those ranges -- a stray U+9225, a Private
+  Use Area codepoint -- is a double-encoding artefact.
+
+The guard deliberately does **not** police which language the team writes in; it
+catches byte-level damage, and the CJK ranges stay allowed for that reason.
 
 Run standalone, from the pre-commit hook, or from CI::
 
@@ -45,21 +48,21 @@ BOM = b"\xef\xbb\xbf"
 #: is to catch double-encoding, not to police which words the team may write.
 ALLOWED_RANGES = (
     (0x0000, 0x007F),  # ASCII
-    (0x00A0, 0x00FF),  # Latin-1 supplement: ±, ×, ÷
-    (0x0391, 0x03C9),  # Greek: Δ, σ
-    (0x2010, 0x203A),  # general punctuation: – — ‘ ’ “ ” …
-    (0x20AC, 0x20AC),  # €
-    (0x2100, 0x2138),  # letterlike symbols: ℃, ™
+    (0x00A0, 0x00FF),  # Latin-1 supplement: plus-minus, multiply, divide
+    (0x0391, 0x03C9),  # Greek: delta, sigma
+    (0x2010, 0x203A),  # general punctuation: en/em dash, curly quotes, ellipsis
+    (0x20AC, 0x20AC),  # euro sign
+    (0x2100, 0x2138),  # letterlike symbols: degree Celsius, trademark
     (0x2190, 0x21FF),  # arrows
-    (0x2200, 0x22FF),  # mathematical operators: − ≤ ≥ ≠ ≡ ∓
-    (0x2460, 0x24FF),  # enclosed alphanumerics: ㈠ ㈡
+    (0x2200, 0x22FF),  # mathematical operators: minus, less/greater, not-equal
+    (0x2460, 0x24FF),  # enclosed alphanumerics
     (0x2500, 0x257F),  # box drawing
     (0x25A0, 0x25FF),  # geometric shapes
-    (0x2600, 0x27BF),  # misc symbols and dingbats: ✓
-    (0x3000, 0x303F),  # CJK punctuation: 、。 「」
+    (0x2600, 0x27BF),  # misc symbols and dingbats: check mark
+    (0x3000, 0x303F),  # CJK punctuation
     (0x3040, 0x30FF),  # hiragana / katakana (used as literal examples)
-    (0x4E00, 0x9FFF),  # CJK unified ideographs: the Chinese quick-start
-    (0xFF00, 0xFFEF),  # fullwidth forms: （） ， ：
+    (0x4E00, 0x9FFF),  # CJK unified ideographs
+    (0xFF00, 0xFFEF),  # fullwidth forms
 )
 
 
@@ -72,51 +75,56 @@ def _allowed(ch: str) -> bool:
 
 #: Codepoints that only ever appeared in this repository as the result of a
 #: cp936 round trip, harvested from the real damage. An explicit blocklist rather
-#: than narrower CJK ranges on purpose: the docs legitimately contain Chinese, and
-#: so do code comments, so tightening the ideograph range would flag real text.
-#: These specific characters are the artefacts `—`, `–`, `→` and `≤` turn into
-#: when their UTF-8 bytes are read as GBK (the third byte is an incomplete
-#: sequence, which shifts the following bytes and yields CJK lookalikes).
+#: than narrower CJK ranges on purpose: the docs are authored by a multilingual
+#: team, so tightening the ideograph range would flag real text.
+#:
+#: These specific characters are what an em dash, en dash, right arrow and
+#: less-than-or-equal sign turn into when their UTF-8 bytes are read as GBK (the
+#: third byte is an incomplete sequence, which shifts the following bytes and
+#: yields CJK lookalikes).
+#:
+#: The codepoints are written as numbers rather than spelled out, so that this
+#: file contains no CJK characters of its own.
 KNOWN_MOJIBAKE = frozenset(
     {
-        0x20AC,  # € -- appeared in the damaged README
-        0x2103,  # ℃
-        0x3221,  # ㈡
-        0x300D,  # 」
-        0xFF45,  # ｅ
-        0xFFE0,  # ￠
-        0x9225,  # 鈥  <- the em dash artefact, the most common one
-        0x9286,  # 銆
-        0x951B,  # 锛
-        0x93C8,  # 鏈
-        0x93C9,  # 鏉
-        0x9428,  # 鐨
-        0x9429,  # 鐩
-        0x95BD,  # 閽
-        0x95C0,  # 闀
-        0x95C7,  # 闇
-        0x922D,  # 鈭
-        0x922E,  # 鈮
-        0x934A,  # 鍊
-        0x934F,  # 鍏
-        0x9350,  # 鍐
-        0x9351,  # 鍑
-        0x9358,  # 鍘
-        0x9359,  # 鍙
-        0x935A,  # 鍚
-        0x9365,  # 鍥
-        0x9366,  # 鍦
-        0x93B5,  # 鎵
-        0x93B7,  # 鎷
-        0x93B9,  # 鎹
-        0x93BA,  # 鎺
-        0x93BB,  # 鎻
-        0x93C1,  # 鏁
-        0x93C2,  # 鏂
-        0x93C3,  # 鏃
-        0x93C4,  # 鏄
-        0x93CD,  # 鏍
-        0x87FD,  # 蟽  <- the sigma artefact
+        0x20AC,  # euro sign -- appeared in the damaged README
+        0x2103,  # degree Celsius
+        0x3221,  # parenthesized ideograph two
+        0x300D,  # right corner bracket
+        0xFF45,  # fullwidth latin small letter e
+        0xFFE0,  # fullwidth cent sign
+        0x9225,  # the em dash artefact, the most common one
+        0x9286,
+        0x951B,
+        0x93C8,
+        0x93C9,
+        0x9428,
+        0x9429,
+        0x95BD,
+        0x95C0,
+        0x95C7,
+        0x922D,
+        0x922E,
+        0x934A,
+        0x934F,
+        0x9350,
+        0x9351,
+        0x9358,
+        0x9359,
+        0x935A,
+        0x9365,
+        0x9366,
+        0x93B5,
+        0x93B7,
+        0x93B9,
+        0x93BA,
+        0x93BB,
+        0x93C1,
+        0x93C2,
+        0x93C3,
+        0x93C4,
+        0x93CD,
+        0x87FD,  # the sigma artefact
         *range(0xE000, 0xF900),  # private use area, written by the bad encoder
     }
 )
