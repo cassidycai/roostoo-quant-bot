@@ -1,0 +1,796 @@
+diff --git a/.env.example b/.env.example
+index 8234ac9..79408ea 100644
+--- a/.env.example
++++ b/.env.example
+@@ -100,6 +100,12 @@ STRATEGY=roostoo.strategies.mean_reversion:MeanReversionStrategy
+ # time and keep only the ones that improve the out-of-sample backtest.
+ STRATEGY_PARAMS={"window":48,"z_entry":2.0,"z_exit_long":-0.25,"z_exit_short":0.25,"adx_period":14,"adx_max":25.0,"min_abs_deviation":0.006,"allow_short":true,"enable_return_shock_filter":false,"enable_vwap_filter":false,"enable_relative_volume_filter":false,"enable_vol_expansion_filter":false}
+ 
++# Opt-in scoring: replace BOTH active strategy lines above with these.
++# Old entry parameters such as z_entry/allow_short are rejected by this class.
++# STRATEGY=roostoo.strategies.scored_mean_reversion:ScoredMeanReversionStrategy
++# STRATEGY_PARAMS={"score_threshold":70,"min_deviation_score":18,"min_reversal_score":15,"volume_factors_enabled":false}
++# See docs/SCORING.md. Existing stop configuration and risk limits still apply.
++
+ # --- Logging ---------------------------------------------------------------
+ LOG_LEVEL=INFO
+ JOURNAL_DIR=journal
+diff --git a/docs/SCORING.md b/docs/SCORING.md
+new file mode 100644
+index 0000000..17179c1
+--- /dev/null
++++ b/docs/SCORING.md
+@@ -0,0 +1,105 @@
++# Scored mean-reversion entries, version 1
++
++Opt-in long-only strategy using the existing Strategy/Signal interfaces,
++universe, portfolio controls, journal and mean exits. The original strategy
++and default selection remain available. Weights are uncalibrated hypotheses.
++
++## Enable
++
++Replace BOTH strategy lines in your local uncommitted `.env`:
++
++```dotenv
++STRATEGY=roostoo.strategies.scored_mean_reversion:ScoredMeanReversionStrategy
++STRATEGY_PARAMS={"score_threshold":70,"min_deviation_score":18,"min_reversal_score":15,"volume_factors_enabled":false}
++```
++
++Do not retain old entry parameters (z_entry, allow_short, require_turn,
++enforce_min_deviation or supplementary-filter switches). They are rejected.
++Both runners call optional configure_execution(cfg) to share actual costs and
++stops. Direct callers must do so too. HISTORY_WINDOW must be >=125 by default.
++An ATR or percentage stop is required; no-stop configurations are rejected.
++
++## Rules
++
++Require 120 valid contiguous closed bars, valid quotes within MAX_SPREAD_BPS,
++live quote age <=two polling intervals, -4<=current Z<=-1.5, ADX<30, positive
++delta Z AND rising close, absolute shock<4, ATR expansion<2.5 and valid stop.
++This intentionally uses current Z after the turn, unlike the old previous-Z
++trigger. Entry needs total>=70, deviation>=18 and reversal>=15.
++
++| Category | Exclusive buckets | Points |
++|---|---|---|
++| Deviation (30) | Z: (-2,-1.5] / (-2.5,-2] / [-3,-2.5] / [-4,-3) | 8 / 18 / 25 / 12 |
++| Deviation | (VWAP24-close)/ATR14 in [0.5,1.5] | +5 |
++| Reversal (25) | delta Z: (0,.15) / [.15,.35) / >=.35 | 5 / 10 / 15 |
++| Reversal | bullish candle, close in upper 35% | +5 |
++| Reversal | lower wick>=1.5*body AND body>=.1*ATR | +5 |
++| Regime (20) | ADX: <18 / [18,23) / [23,27) / [27,30) | 15 / 10 / 5 / 0 |
++| Regime | absolute 4-bar SMA48 change<=.5*ATR | +5 |
++| Safety/volume (15) | absolute shock: <1.5 / [1.5,2.5) / [2.5,4) | 5 / 3 / 0 |
++| Safety/volume | expansion: <1.3 / [1.3,1.8) / [1.8,2.5) | +5 / +3 / +0 |
++| Safety/volume | bullish AND relative volume: [1.2,3) / [.8,1.2) / other | +5 / +2 / +0 |
++| Economics (10) | target distance/cost: >=5 / [4,5) / [3,4) | 10 / 7 / 4 |
++
++Missing optional data earn zero without redistributing points. Volume factors
++default OFF for both live and backtest (maximum 90/100). Only enable with
++reliable volume: rolling 24-hour turnover differences are not true bar volume.
++Default deviation floor also prevents Z below -3 or above -2 qualifying,
++because those buckets cannot reach 18 even with the VWAP bonus.
++
++Z uses sample standard deviation. Shock is current log return divided by
++PREVIOUS 48 log-return standard deviation, excluding current. Expansion is
++current Wilder ATR14 / mean of PREVIOUS 48 Wilder ATR14 readings. These differ
++intentionally from legacy simple-return shock and high-low-range expansion.
++VWAP uses 24 typical-price bars; relative volume uses PREVIOUS 20 volume bars.
++
++## Economics and execution
++
++Entry-time estimated target=SMA48+z_exit_long*Std48. Actual inherited mean exit
++recalculates Z, so this is not a fixed profit order or expected profit.
++Use MID P: G=target/P-1; C=2*TAKER_FEE+2*SLIPPAGE_BPS/10000+spread_bps/10000;
++L=(P-stop)/P. Require G/C>=3 and (G-C)/(L+C)>=1.2.
++One full spread estimates round-trip spread; using ask as P would double-count.
++The existing backtest fill model charges fees/slippage but does not separately
++charge this assumed spread. This PR preserves that convention and uses the
++spread conservatively in the entry gate.
++
++Risk tiers: score<80 =>.20% NAV; [80,90)=>.35%; >=90=>.50%, always capped by
++RISK_PER_TRADE_PCT. Cap notional by NAV*risk/(L+C), then existing pair/gross caps.
++Planned risk includes estimated costs; actual slippage/gaps can exceed it.
++
++Sort entries by score, net reward/risk, lower cost, then pair name. Exits first.
++A lower score after entry does not itself trigger an exit. Versioned signal
++metadata includes a deterministic audit ID; existing once-per-bar decisions
++and pending-order reservations still provide duplicate protection.
++
++RiskManager rechecks current price, Config costs, stop, score and age. Expire
++one full bar after source-bar CLOSE; normal next-open fill has age zero.
++Backtester checks again at next open and can cancel or shrink, never enlarge.
++It uses only the new open and original target/stop, not future OHLC/indicators.
++Existing basis/depth behavior is preserved, including fail-open basis checks
++on provider outages. Live sampled OHLC still differs from true backtest OHLC.
++
++## Verify
++
++```bash
++python -m unittest discover -s tests -t .
++python -m compileall -q roostoo tests run_live.py run_backtest.py run_sweep.py scripts
++python scripts/check_encoding.py
++python scripts/scan_secrets.py
++python run_live.py --mock --cycles 2 --loop-interval 5 --no-seed --strategy roostoo.strategies.scored_mean_reversion:ScoredMeanReversionStrategy
++python run_backtest.py --env .env.scored --oos-frac 0.25 --journal --out-dir reports/scored
++```
++
++Compare using separate baseline/scored env files and journal directories; fix
++the same costs, stops, holding time, universe and volume capability. Use a
++long-only baseline to isolate scoring. Process environment overrides dotenv.
++The old edge_analysis.py hardcodes old entry rules and DOES NOT test scoring.
++Use the actual Backtester, chronological holdouts and score-bin net results.
++
++Verification: 444 tests including 26 new cases passed on the tested checkout.
++The committed ETH sample (1200 bars) produced ZERO trades with default scoring;
++this confirms a smoke run, not profitability. Inspect rejection diagnostics
++before lowering thresholds. Check activity days as well as risk-adjusted returns.
++Journal includes raw factors, category scores, economics, source score, repriced
++score, risk fraction and rejection reasons. Score is not a win probability.
+diff --git a/roostoo/backtest.py b/roostoo/backtest.py
+index 008d52b..a4696a6 100644
+--- a/roostoo/backtest.py
++++ b/roostoo/backtest.py
+@@ -61,6 +61,7 @@ from .strategies.base import (
+     Strategy,
+ )
+ from .universe import NullDepthProvider, UniverseSelector
++from .strategies.scoring import execution_terms
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -212,6 +213,9 @@ class Backtester:
+     ) -> None:
+         self.cfg = cfg
+         self.strategy = strategy
++        configure = getattr(self.strategy, "configure_execution", None)
++        if configure is not None:
++            configure(cfg)
+         self.label = label
+         self.execution_delay_bars = max(0, int(execution_delay_bars))
+         self.assumed_spread_bps = float(assumed_spread_bps)
+@@ -500,6 +504,29 @@ class Backtester:
+             ts_ms = ts
+ 
+         if action.action == ENTER_LONG:
++            if "scoring_version" in action.meta:
++                rejection, terms = execution_terms(
++                    self.cfg, action.meta, reference=reference_price,
++                    spread_bps=self.assumed_spread_bps,
++                    stop_price=action.stop_price, now_ms=ts_ms,
++                )
++                if rejection:
++                    self.rejections[rejection] += 1
++                    return
++                # A next-open gap can change stop risk. Shrink, never enlarge,
++                # the approved quantity using the current NAV and fixed stop.
++                fill_price = reference_price * (1.0 + slip)
++                stop_loss = fill_price - action.stop_price
++                nav_now = portfolio_nav(self.cash_usd, self.book.held())
++                loss_per_unit = stop_loss + fill_price * terms["cost_pct"]
++                quantity_cap = nav_now * terms["risk_per_trade_pct"] / loss_per_unit
++                action.quantity = min(action.quantity, quantity_cap)
++                action.notional = action.quantity * fill_price
++                action.risk_amount = action.quantity * loss_per_unit
++                action.meta.update(terms)
++                if action.notional < self.cfg.min_order_notional:
++                    self.rejections["scored fill below minimum notional"] += 1
++                    return
+             price = reference_price * (1.0 + slip)
+             quantity = self._clamp_quantity(action.quantity, price, self.cash_usd)
+             if quantity <= 0:
+diff --git a/roostoo/engine.py b/roostoo/engine.py
+index 7e72cd4..218c9d1 100644
+--- a/roostoo/engine.py
++++ b/roostoo/engine.py
+@@ -101,6 +101,9 @@ class TradingEngine:
+         self.client = client or build_client(cfg)
+         self.journal = journal if journal is not None else Journal(cfg.journal_dir)
+         self.strategy = load_strategy(cfg.strategy, cfg.strategy_params)
++        configure = getattr(self.strategy, "configure_execution", None)
++        if configure is not None:
++            configure(cfg)
+         self.stats = EngineStats()
+ 
+         self.exchange_pairs: dict[str, TradePair] = {}
+diff --git a/roostoo/risk.py b/roostoo/risk.py
+index 3708ef9..bf1c17b 100644
+--- a/roostoo/risk.py
++++ b/roostoo/risk.py
+@@ -41,6 +41,7 @@ from .config import Config
+ from .metrics import MetricTracker
+ from .models import Position, Ticker
+ from .strategies.base import ENTER_LONG, ENTER_SHORT, EXIT_LONG, EXIT_SHORT, Signal
++from .strategies.scoring import execution_terms
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -858,6 +859,32 @@ class RiskManager:
+                 gross_budget_left=gross_cap - projected_gross,
+                 is_short=is_short,
+             )
++            scored_meta = dict(signal.meta)
++            if "scoring_version" in signal.meta:
++                if is_short:
++                    decision.rejected.append((pair, "scored v1 is long-only"))
++                    continue
++                if ticker is None or not all(math.isfinite(x) and x > 0 for x in (ticker.max_bid, ticker.min_ask)) or ticker.max_bid > ticker.min_ask or ticker.spread_bps > self.cfg.max_spread_bps:
++                    decision.rejected.append((pair, "invalid or wide scored quote"))
++                    continue
++                rejection, terms = execution_terms(
++                    self.cfg, signal.meta, reference=price,
++                    spread_bps=ticker.spread_bps, stop_price=sizing.stop_price,
++                    now_ms=now_ms,
++                )
++                if rejection:
++                    decision.rejected.append((pair, rejection))
++                    continue
++                loss_fraction = (price - sizing.stop_price) / price + terms["cost_pct"]
++                score_cap = view.nav * terms["risk_per_trade_pct"] / loss_fraction
++                if score_cap < sizing.notional:
++                    sizing.notional = score_cap
++                    sizing.quantity = score_cap / price
++                    sizing.binding = "score_risk_budget"
++                sizing.risk_amount = sizing.notional * loss_fraction
++                scored_meta.update(terms)
++                scored_meta["entry_score_at_signal"] = signal.meta.get("entry_score")
++                scored_meta["factor_scores"] = {**signal.meta.get("factor_scores", {}), "cost": int(terms["cost_score"])}
+             if sizing.notional < self.cfg.min_order_notional:
+                 decision.rejected.append(
+                     (pair, f"sized {sizing.notional:,.2f} < min order {self.cfg.min_order_notional:,.2f}")
+@@ -875,7 +902,7 @@ class RiskManager:
+                     stop_price=sizing.stop_price,
+                     risk_amount=sizing.risk_amount,
+                     binding=sizing.binding,
+-                    meta={**dict(signal.meta), "strength": round(signal.strength, 4)},
++                    meta={**scored_meta, "strength": round(signal.strength, 4)},
+                 )
+             )
+             projected_pairs.add(pair)
+diff --git a/roostoo/strategies/scored_mean_reversion.py b/roostoo/strategies/scored_mean_reversion.py
+new file mode 100644
+index 0000000..2023a38
+--- /dev/null
++++ b/roostoo/strategies/scored_mean_reversion.py
+@@ -0,0 +1,179 @@
++"""100-point, long-only mean reversion; existing mean exits are inherited."""
++
++from __future__ import annotations
++
++import math
++from typing import Any
++
++from .. import indicators as ind
++from ..config import Config
++from ..risk import PositionSizer
++from .base import ENTER_LONG, MarketContext, Signal
++from .mean_reversion import MeanReversionStrategy
++from .scoring import SCORING_VERSION, economics, factor_scores
++
++
++class ScoredMeanReversionStrategy(MeanReversionStrategy):
++    name = "scored_mean_reversion"
++
++    @classmethod
++    def default_params(cls) -> dict[str, Any]:
++        return {
++            "window": 48, "atr_period": 14, "adx_period": 14,
++            "z_exit_long": -0.25, "z_exit_short": 0.25,
++            "warmup_bars": 120, "score_threshold": 70.0,
++            "min_deviation_score": 18, "min_reversal_score": 15,
++            "z_min": -4.0, "z_max": -1.5, "adx_max": 30.0,
++            "shock_max": 4.0, "expansion_max": 2.5,
++            "shock_window": 48, "expansion_window": 48,
++            "vwap_window": 24, "volume_window": 20,
++            "volume_factors_enabled": False,
++            "min_cost_coverage": 3.0, "min_net_rr": 1.2,
++        }
++
++    def __init__(self, params: dict[str, Any] | None = None) -> None:
++        super().__init__(params)
++        self._cfg: Config | None = None
++        for key in ("window", "atr_period", "adx_period", "warmup_bars", "shock_window", "expansion_window", "vwap_window", "volume_window"):
++            value = self.params[key]
++            if isinstance(value, bool) or not isinstance(value, int) or value < 2:
++                raise ValueError(f"{key} must be an integer >= 2")
++        if not isinstance(self.params["volume_factors_enabled"], bool):
++            raise ValueError("volume_factors_enabled must be a boolean")
++        for key, value in self.params.items():
++            if key == "volume_factors_enabled":
++                continue
++            if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
++                raise ValueError(f"{key} must be finite and numeric")
++        if not 0 <= self.params["score_threshold"] <= 100:
++            raise ValueError("score_threshold must be in [0, 100]")
++        for key, cap in (("min_deviation_score", 30), ("min_reversal_score", 25)):
++            if not 0 <= self.params[key] <= cap:
++                raise ValueError(f"{key} outside category cap")
++        if not self.params["z_min"] < self.params["z_max"] < self.params["z_exit_long"]:
++            raise ValueError("require z_min < z_max < z_exit_long")
++        for key in ("adx_max", "shock_max", "expansion_max", "min_cost_coverage", "min_net_rr"):
++            if self.params[key] <= 0:
++                raise ValueError(f"{key} must be positive")
++
++    def configure_execution(self, cfg: Config) -> None:
++        """Optional hook called by both runners; Strategy interface is unchanged."""
++        if cfg.history_window < self.max_context_bars:
++            raise ValueError("HISTORY_WINDOW too small for the scored strategy")
++        if not (cfg.stop_atr_mult or cfg.stop_loss_pct):
++            raise ValueError("scored strategy requires an ATR or percentage stop")
++        self._cfg = cfg
++
++    @property
++    def min_bars(self) -> int:
++        return self._required_bars()
++
++    def _required_bars(self) -> int:
++        p = self.params
++        return max(p["warmup_bars"], p["window"] + 4,
++                   2 * p["adx_period"] + 2, p["shock_window"] + 2,
++                   p["atr_period"] + p["expansion_window"] + 1,
++                   p["vwap_window"], p["volume_window"] + 1)
++
++    def _entries(self, ctx: MarketContext, need: int) -> list[Signal]:
++        if self._cfg is None:
++            raise RuntimeError("call configure_execution(cfg) before generating scored entries")
++        cfg, p = self._cfg, self.params
++        out: list[Signal] = []
++        held = ctx.held_pairs()
++        for pair in ctx.universe:
++            if ctx.daily_halt or pair in held or pair in ctx.blocked:
++                self.note(pair, entry_skipped="held, blocked or daily halt")
++                continue
++            bars = ctx.series(pair)
++            if len(bars) < need:
++                self.note(pair, entry_skipped=f"need {need} closed bars")
++                continue
++            bars = bars[-self.max_context_bars:]
++            step = ctx.bar_seconds * 1000
++            valid = all(
++                all(math.isfinite(x) and x > 0 for x in (b.open, b.high, b.low, b.close))
++                and b.low <= min(b.open, b.close) <= max(b.open, b.close) <= b.high
++                and b.ts_ms % step == 0
++                for b in bars
++            ) and all(b.ts_ms - a.ts_ms == step for a, b in zip(bars, bars[1:]))
++            closed_ms = bars[-1].ts_ms + step
++            if not valid or not 0 <= ctx.now_ms - closed_ms < step:
++                self.note(pair, entry_skipped="invalid, missing, unclosed or stale bars")
++                continue
++            ticker = ctx.tickers.get(pair)
++            if ticker is None or not all(math.isfinite(x) and x > 0 for x in (ticker.max_bid, ticker.min_ask)) or ticker.max_bid > ticker.min_ask:
++                self.note(pair, entry_skipped="invalid bid/ask")
++                continue
++            if not ctx.is_backtest and not 0 <= ctx.now_ms - ticker.server_time_ms <= 2 * cfg.loop_interval_sec * 1000:
++                self.note(pair, entry_skipped="stale quote")
++                continue
++            if ticker.spread_bps > cfg.max_spread_bps:
++                self.note(pair, entry_skipped="spread exceeds configured limit")
++                continue
++            closes = [b.close for b in bars]
++            highs, lows = [b.high for b in bars], [b.low for b in bars]
++            zs = ind.zscore_series(closes, p["window"])
++            atr = ind.atr_wilder(highs, lows, closes, p["atr_period"])
++            adx = ind.adx(highs, lows, closes, p["adx_period"])
++            returns = ind.log_returns(closes)
++            sd_return = ind.stdev(returns[-p["shock_window"] - 1:-1])
++            shock = returns[-1] / sd_return if sd_return else None
++            # A Wilder pass gives ATR_t and the preceding ATR observations.
++            atrs = [x / p["atr_period"] for x in ind._wilder(ind.true_range(highs, lows, closes), p["atr_period"])]
++            baseline = ind.mean(atrs[-p["expansion_window"] - 1:-1])
++            expansion = atr / baseline if atr and baseline else None
++            mean = ind.sma(closes, p["window"])
++            std = ind.stdev(closes[-p["window"]:])
++            old_mean = ind.sma(closes[:-4], p["window"])
++            essentials = (atr, adx, shock, expansion, mean, std, old_mean)
++            if len(zs) < 2 or any(x is None or not math.isfinite(x) for x in essentials) or atr <= 0 or std <= 0:
++                self.note(pair, entry_skipped="core indicator unavailable")
++                continue
++            z, dz = zs[-1], zs[-1] - zs[-2]
++            self.note(pair, z=z, delta_z=dz, adx=adx, atr=atr, return_shock=shock, vol_expansion=expansion)
++            if not p["z_min"] <= z <= p["z_max"] or adx >= p["adx_max"] or dz <= 0 or closes[-1] <= closes[-2] or abs(shock) >= p["shock_max"] or expansion >= p["expansion_max"]:
++                self.note(pair, entry_skipped="deviation, reversal, trend or shock gate")
++                continue
++            volumes = [b.volume for b in bars]
++            volume_ok = p["volume_factors_enabled"] and all(math.isfinite(v) and v >= 0 for v in volumes)
++            vwap = ind.vwap(highs, lows, closes, volumes, p["vwap_window"]) if volume_ok else None
++            rel = ind.relative_volume(volumes, p["volume_window"]) if volume_ok else None
++            b = bars[-1]
++            factors = factor_scores(z=z, delta_z=dz, adx=adx, atr=atr,
++                                    open_price=b.open, high=b.high, low=b.low, close=b.close,
++                                    sma_change=mean - old_mean, shock=shock, expansion=expansion,
++                                    vwap=vwap, relative_volume=rel)
++            target = mean + p["z_exit_long"] * std
++            reference = ticker.mid
++            distance = PositionSizer(cfg).stop_distance(reference, atr)
++            cost = 2 * cfg.taker_fee + 2 * cfg.slippage_bps / 10_000 + ticker.spread_bps / 10_000
++            try:
++                econ = economics(target, reference, distance if distance is not None else 0, cost)
++            except ValueError:
++                self.note(pair, entry_skipped="invalid stop or economics")
++                continue
++            factors["cost"] = int(econ["cost_score"])
++            score = sum(factors.values())
++            self.note(pair, entry_score=score, factor_scores=factors, economics=econ, volume_factors_used=bool(volume_ok), vwap=vwap, relative_volume=rel)
++            if factors["deviation"] < p["min_deviation_score"] or factors["reversal"] < p["min_reversal_score"]:
++                self.note(pair, entry_skipped="core category score too low")
++                continue
++            if econ["cost_coverage"] < p["min_cost_coverage"] or econ["net_rr"] < p["min_net_rr"]:
++                self.note(pair, entry_skipped="insufficient cost coverage or net reward/risk")
++                continue
++            if score < p["score_threshold"]:
++                self.note(pair, entry_skipped="total score below threshold")
++                continue
++            meta = self._meta(pair, z, zs[-2], adx, atr, bars)
++            meta["atr"] = atr  # Preserve stop precision for low-price coins.
++            meta.update(econ)
++            meta.update({"scoring_version": SCORING_VERSION, "entry_score": score,
++                         "factor_scores": factors, "score_without_cost": score - factors["cost"],
++                         "target_price": target, "signal_close_ms": closed_ms,
++                         "score_threshold": p["score_threshold"],
++                         "min_cost_coverage": p["min_cost_coverage"], "min_net_rr": p["min_net_rr"],
++                         "signal_id": f"{SCORING_VERSION}:{pair}:{b.ts_ms}"})
++            out.append(Signal(pair, ENTER_LONG, strength=score / 100,
++                              reason=f"entry score {score}/100 >= {p['score_threshold']:g}", meta=meta))
++        return sorted(out, key=lambda s: (-s.meta["entry_score"], -s.meta["net_rr"], s.meta["cost_pct"], s.pair))
+diff --git a/roostoo/strategies/scoring.py b/roostoo/strategies/scoring.py
+new file mode 100644
+index 0000000..a0de078
+--- /dev/null
++++ b/roostoo/strategies/scoring.py
+@@ -0,0 +1,96 @@
++"""Pure scoring and execution economics for the long-only scored strategy."""
++
++from __future__ import annotations
++
++import math
++from typing import Any, Optional
++
++from ..config import Config
++
++SCORING_VERSION = "mean_reversion_score_v1"
++
++
++def factor_scores(
++    *, z: float, delta_z: float, adx: float, atr: float,
++    open_price: float, high: float, low: float, close: float,
++    sma_change: float, shock: float, expansion: float,
++    vwap: Optional[float] = None, relative_volume: Optional[float] = None,
++) -> dict[str, int]:
++    """Each bucket is exclusive; caps sum to 100 with economics."""
++    deviation = (
++        8 if -2 < z <= -1.5 else
++        18 if -2.5 < z <= -2 else
++        25 if -3 <= z <= -2.5 else
++        12 if -4 <= z < -3 else 0
++    )
++    if vwap is not None and math.isfinite(vwap) and atr > 0:
++        if 0.5 <= (vwap - close) / atr <= 1.5:
++            deviation += 5
++    reversal = 5 if 0 < delta_z < 0.15 else 10 if 0.15 <= delta_z < 0.35 else 15 if delta_z >= 0.35 else 0
++    body = abs(close - open_price)
++    if close > open_price and high > low and (close - low) / (high - low) >= 0.65:
++        reversal += 5
++    if body >= 0.1 * atr and min(open_price, close) - low >= 1.5 * body:
++        reversal += 5
++    regime = 15 if adx < 18 else 10 if adx < 23 else 5 if adx < 27 else 0
++    if abs(sma_change) <= 0.5 * atr:
++        regime += 5
++    safety = 5 if abs(shock) < 1.5 else 3 if abs(shock) < 2.5 else 0
++    safety += 5 if expansion < 1.3 else 3 if expansion < 1.8 else 0
++    if relative_volume is not None and math.isfinite(relative_volume) and close > open_price:
++        safety += 5 if 1.2 <= relative_volume < 3 else 2 if 0.8 <= relative_volume < 1.2 else 0
++    return {"deviation": deviation, "reversal": reversal, "regime": regime, "safety": safety}
++
++
++def economics(target: float, reference: float, distance: float, cost: float) -> dict[str, float]:
++    """Use mid as reference; cost includes spread, fees and both slippages."""
++    if not all(math.isfinite(x) for x in (target, reference, distance, cost)):
++        raise ValueError("non-finite economics")
++    if reference <= 0 or distance <= 0 or cost <= 0 or distance >= reference:
++        raise ValueError("invalid economics")
++    gain = target / reference - 1.0
++    coverage = gain / cost
++    rr = (gain - cost) / (distance / reference + cost)
++    points = 10 if coverage >= 5 else 7 if coverage >= 4 else 4 if coverage >= 3 else 0
++    return {"gain_pct": gain, "cost_pct": cost, "cost_coverage": coverage, "net_rr": rr, "cost_score": points}
++
++
++def risk_fraction(score: float) -> float:
++    return 0.005 if score >= 90 else 0.0035 if score >= 80 else 0.002
++
++
++def execution_terms(
++    cfg: Config, meta: dict[str, Any], *, reference: float,
++    spread_bps: float, stop_price: Optional[float], now_ms: int,
++) -> tuple[Optional[str], dict[str, float]]:
++    """Recheck score, current economics, signal age and actual stop."""
++    try:
++        if meta.get("scoring_version") != SCORING_VERSION:
++            return "unsupported scoring version", {}
++        bar_close = float(meta["signal_close_ms"])
++        age = now_ms - bar_close
++        if not math.isfinite(bar_close) or age < 0 or age >= cfg.bar_seconds * 1000:
++            return "scored signal expired or from the future", {}
++        if stop_price is None or not math.isfinite(stop_price) or stop_price <= 0:
++            return "scored entry needs a valid stop", {}
++        if not math.isfinite(spread_bps) or spread_bps < 0:
++            return "invalid scored spread", {}
++        cost = 2 * cfg.taker_fee + 2 * cfg.slippage_bps / 10_000 + spread_bps / 10_000
++        result = economics(float(meta["target_price"]), reference, reference - stop_price, cost)
++        threshold = float(meta["score_threshold"])
++        coverage_min = float(meta["min_cost_coverage"])
++        rr_min = float(meta["min_net_rr"])
++        score = float(meta["score_without_cost"]) + result["cost_score"]
++        if not all(math.isfinite(x) for x in (threshold, coverage_min, rr_min, score)):
++            return "invalid scored metadata", {}
++        result["entry_score"] = score
++        result["risk_per_trade_pct"] = min(cfg.risk_per_trade_pct, risk_fraction(score))
++        if result["cost_coverage"] < coverage_min:
++            return "scored target does not cover costs", result
++        if result["net_rr"] < rr_min:
++            return "scored net reward/risk too low", result
++        if score < threshold:
++            return "scored entry below threshold after repricing", result
++        return None, result
++    except (KeyError, TypeError, ValueError, OverflowError):
++        return "invalid scored execution inputs", {}
+diff --git a/tests/test_scored_mean_reversion.py b/tests/test_scored_mean_reversion.py
+new file mode 100644
+index 0000000..ae2d11b
+--- /dev/null
++++ b/tests/test_scored_mean_reversion.py
+@@ -0,0 +1,255 @@
++"""Score boundaries, signal gates, risk enforcement and delayed execution."""
++
++from __future__ import annotations
++
++import math
++import unittest
++from dataclasses import replace
++from unittest.mock import patch
++
++from roostoo.backtest import Backtester
++from roostoo.candles import Candle
++from roostoo.config import Config
++from roostoo.models import Position, Ticker
++from roostoo.risk import PortfolioView, RiskManager
++from roostoo.strategies.base import ENTER_LONG, ENTER_SHORT, EXIT_LONG, MarketContext, Signal, load_strategy
++from roostoo.strategies.mean_reversion import MeanReversionStrategy
++from roostoo.strategies.scored_mean_reversion import ScoredMeanReversionStrategy
++from roostoo.strategies.scoring import SCORING_VERSION, economics, execution_terms, factor_scores, risk_fraction
++
++PAIR = "BTC/USD"
++STEP = 1_800_000
++
++
++def ticker(price=95.0, now=120 * STEP):
++    return Ticker(PAIR, price, price * 0.99975, price * 1.00025, 0, 100, 10000, now)
++
++
++def context():
++    bars = [Candle(i * STEP, 100, 101, 99, 100, 10) for i in range(118)]
++    bars += [Candle(118 * STEP, 95, 95.5, 93.5, 94, 10),
++             Candle(119 * STEP, 94.8, 95.1, 94.1, 95, 15)]
++    return MarketContext(120 * STEP, 1800, {PAIR: bars}, {PAIR: ticker()},
++                         nav=100000, cash_usd=100000, universe=[PAIR], is_backtest=True)
++
++
++def metadata(subtotal=75, threshold=70, target=105):
++    return {"scoring_version": SCORING_VERSION, "signal_close_ms": 120 * STEP,
++            "target_price": target, "score_without_cost": subtotal,
++            "entry_score": subtotal + 10, "score_threshold": threshold,
++            "min_cost_coverage": 3, "min_net_rr": 1.2, "atr": 1,
++            "factor_scores": {"cost": 10}}
++
++
++class FactorTests(unittest.TestCase):
++    def scores(self, **overrides):
++        args = dict(z=-2.6, delta_z=0.4, adx=15, atr=1,
++                    open_price=94.8, high=95.1, low=94.1, close=95,
++                    sma_change=0, shock=0.5, expansion=1, vwap=96, relative_volume=1.5)
++        args.update(overrides)
++        return factor_scores(**args)
++
++    def test_maximum_and_no_volume_reweighting(self):
++        self.assertEqual(self.scores(), {"deviation": 30, "reversal": 25, "regime": 20, "safety": 15})
++        self.assertEqual(sum(self.scores(vwap=None, relative_volume=None).values()), 80)
++
++    def test_exclusive_z_boundaries(self):
++        for z, expected in [(-1.5, 8), (-2, 18), (-2.5, 25), (-3, 25), (-3.01, 12), (-4, 12), (-4.01, 0)]:
++            with self.subTest(z=z):
++                self.assertEqual(self.scores(z=z, vwap=None)["deviation"], expected)
++
++    def test_stronger_shocks_and_extreme_volume_do_not_add_points(self):
++        self.assertLess(self.scores(shock=3)["safety"], self.scores()["safety"])
++        self.assertEqual(self.scores(relative_volume=3)["safety"], 10)
++        self.assertEqual(self.scores(close=94.7)["safety"], 10)
++
++    def test_cost_score_and_invalid_inputs(self):
++        self.assertEqual(economics(106, 100, 2, 0.01)["cost_score"], 10)
++        self.assertEqual(economics(104.5, 100, 2, 0.01)["cost_score"], 7)
++        self.assertEqual(economics(103.5, 100, 2, 0.01)["cost_score"], 4)
++        for bad in [0, math.nan, math.inf]:
++            with self.assertRaises(ValueError):
++                economics(106, 100, 2, bad)
++
++    def test_risk_tiers(self):
++        self.assertEqual([risk_fraction(x) for x in (70, 79, 80, 89, 90)], [.002, .002, .0035, .0035, .005])
++
++
++class StrategyTests(unittest.TestCase):
++    def setUp(self):
++        self.strategy = ScoredMeanReversionStrategy()
++        self.strategy.configure_execution(Config())
++        self.ctx = context()
++
++    def generate(self, **indicators):
++        # Separate the scoring/gating contract from Wilder indicator tests,
++        # which already cover the repository's indicator implementations.
++        defaults = {"zscore_series": [-2.9, -2.6], "atr_wilder": 1.0,
++                    "adx": 15.0, "log_returns": [0.01, -0.01] * 60,
++                    "stdev": 2.0, "sma": 100.0, "_wilder": [14.0] * 100}
++        defaults.update(indicators)
++        patches = [patch(f"roostoo.strategies.scored_mean_reversion.ind.{key}", return_value=value)
++                   for key, value in defaults.items()]
++        for item in patches:
++            item.start()
++        try:
++            return self.strategy.generate(self.ctx)
++        finally:
++            for item in reversed(patches):
++                item.stop()
++
++    def test_valid_entry_metadata(self):
++        signals = self.generate()
++        self.assertEqual(len(signals), 1)
++        self.assertEqual(signals[0].action, ENTER_LONG)
++        self.assertEqual(signals[0].meta["entry_score"], 85)
++        self.assertEqual(signals[0].meta["factor_scores"]["deviation"], 25)
++        self.assertFalse(self.strategy.diagnostics[PAIR]["volume_factors_used"])
++
++    def test_threshold_equality_then_rejection(self):
++        self.strategy.params["score_threshold"] = 85
++        self.assertEqual(len(self.generate()), 1)
++        self.strategy.params["score_threshold"] = 86
++        self.assertEqual(self.generate(), [])
++
++    def test_core_minimum_cannot_be_bypassed_by_low_total_threshold(self):
++        self.strategy.params["score_threshold"] = 0
++        self.assertEqual(self.generate(zscore_series=[-1.9, -1.8]), [])
++
++    def test_hard_gates(self):
++        for overrides in ({"adx": 30}, {"zscore_series": [-4.3, -4.1]},
++                          {"zscore_series": [-2.5, -2.6]}, {"atr_wilder": math.nan}):
++            with self.subTest(overrides=overrides):
++                self.assertEqual(self.generate(**overrides), [])
++
++    def test_price_must_rise_even_if_z_improves(self):
++        self.ctx.candles[PAIR][-1] = replace(self.ctx.candles[PAIR][-1], close=94.0)
++        self.assertEqual(self.generate(), [])
++
++    def test_missing_gap_future_and_unclosed_bars(self):
++        for mode in ("short", "gap", "future", "nan"):
++            self.ctx = context()
++            if mode == "short":
++                self.ctx.candles[PAIR] = self.ctx.candles[PAIR][-20:]
++            elif mode == "gap":
++                self.ctx.candles[PAIR][30] = replace(self.ctx.candles[PAIR][30], ts_ms=29 * STEP)
++            elif mode == "future":
++                self.ctx.now_ms -= 1
++            else:
++                self.ctx.candles[PAIR][30] = replace(self.ctx.candles[PAIR][30], close=math.nan)
++            with self.subTest(mode=mode):
++                self.assertEqual(self.generate(), [])
++
++    def test_stale_quote_in_live_mode(self):
++        self.ctx.is_backtest = False
++        self.ctx.tickers[PAIR] = replace(ticker(), server_time_ms=self.ctx.now_ms - 121000)
++        self.assertEqual(self.generate(), [])
++
++    def test_daily_halt_blocked_and_held(self):
++        for mode in ("halt", "blocked", "held"):
++            self.ctx = context()
++            if mode == "halt":
++                self.ctx.daily_halt = True
++            elif mode == "blocked":
++                self.ctx.blocked.add(PAIR)
++            else:
++                self.ctx.positions[PAIR] = Position(PAIR, quantity=1)
++            self.assertFalse(any(s.is_entry for s in self.generate()))
++
++    def test_mean_exit_does_not_depend_on_entry_score(self):
++        self.ctx.positions[PAIR] = Position(PAIR, quantity=1)
++        self.strategy.params["score_threshold"] = 100
++        signals = self.generate(zscore_series=[-0.3, -0.2])
++        self.assertEqual([s.action for s in signals], [EXIT_LONG])
++
++    def test_deterministic_ranking(self):
++        self.ctx.candles["AAA/USD"] = list(self.ctx.candles[PAIR])
++        self.ctx.tickers["AAA/USD"] = replace(ticker(), pair="AAA/USD")
++        self.ctx.universe.append("AAA/USD")
++        self.assertEqual([s.pair for s in self.generate()], ["AAA/USD", PAIR])
++
++    def test_parameter_validation_and_config_binding(self):
++        for params in ({"score_threshold": math.nan}, {"window": 1}, {"volume_factors_enabled": "false"}, {"z_entry": 2}):
++            with self.assertRaises(ValueError):
++                ScoredMeanReversionStrategy(params)
++        with self.assertRaises(ValueError):
++            self.strategy.configure_execution(Config(stop_atr_mult=None, stop_loss_pct=None))
++        with self.assertRaises(ValueError):
++            self.strategy.configure_execution(Config(history_window=50))
++        loaded = load_strategy("roostoo.strategies.scored_mean_reversion:ScoredMeanReversionStrategy")
++        self.assertIsInstance(loaded, ScoredMeanReversionStrategy)
++
++
++class RiskAndFillTests(unittest.TestCase):
++    def approve(self, meta=None, cfg=None, **kwargs):
++        cfg = cfg or Config()
++        meta = metadata() if meta is None else meta
++        manager = RiskManager(cfg)
++        signal = Signal(PAIR, ENTER_LONG, meta=meta)
++        return manager.evaluate([signal], view=PortfolioView(100000, 100000),
++                                tickers={PAIR: ticker(100)}, now_ms=120 * STEP,
++                                bar_idx=120, **kwargs)
++
++    def test_risk_budget_includes_cost_and_cfg_ceiling(self):
++        action = self.approve(cfg=Config(max_pair_weight=.4, max_gross_exposure=.8, max_open_positions=2)).approved[0]
++        loss_fraction = (100 - action.stop_price) / 100 + action.meta["cost_pct"]
++        self.assertAlmostEqual(action.notional * loss_fraction, 350)
++        self.assertAlmostEqual(action.risk_amount, 350)
++        lower = self.approve(cfg=Config(risk_per_trade_pct=.001)).approved[0]
++        self.assertAlmostEqual(lower.risk_amount, 100)
++
++    def test_actual_costs_reject_entry(self):
++        self.assertFalse(self.approve(cfg=Config(taker_fee=.01)).approved)
++
++    def test_inflight_reservation_still_blocks_duplicate(self):
++        self.assertFalse(self.approve(committed_pairs={PAIR}, committed_notional=1000).approved)
++
++    def test_no_stop_and_malformed_metadata_fail_closed(self):
++        self.assertFalse(self.approve(cfg=Config(stop_atr_mult=None)).approved)
++        self.assertFalse(self.approve(meta={"scoring_version": SCORING_VERSION}).approved)
++        self.assertFalse(self.approve(meta={**metadata(), "target_price": math.nan}).approved)
++
++    def test_short_scored_signal_rejected(self):
++        manager = RiskManager(Config())
++        result = manager.evaluate([Signal(PAIR, ENTER_SHORT, meta=metadata())],
++                                  view=PortfolioView(100000, 100000), tickers={PAIR: ticker(100)},
++                                  now_ms=120 * STEP, bar_idx=120)
++        self.assertFalse(result.approved)
++
++    def test_legacy_sizing_stays_unchanged(self):
++        action = self.approve(meta={"atr": 1}).approved[0]
++        self.assertEqual(action.notional, 15000)
++        self.assertEqual(action.risk_amount, 500)
++
++    def test_signal_expiry(self):
++        error, _ = execution_terms(Config(), metadata(), reference=100,
++                                   spread_bps=5, stop_price=98.5, now_ms=121 * STEP)
++        self.assertIn("expired", error)
++
++    def test_fill_rechecks_next_open_and_gap_risk(self):
++        cfg = Config()
++        bt = Backtester(cfg, MeanReversionStrategy(), {PAIR: context().candles[PAIR]})
++        rejected = self.approve().approved[0]
++        bt._fill(rejected, reference_price=104.5, ts=120 * STEP, source="open")
++        self.assertEqual(bt.trades, [])
++        action = self.approve(meta=metadata(target=110)).approved[0]
++        original_quantity = action.quantity
++        bt._fill(action, reference_price=102, ts=120 * STEP, source="open")
++        self.assertEqual(len(bt.trades), 1)
++        self.assertLess(action.quantity, original_quantity)
++        self.assertLessEqual(action.risk_amount, 350.000001)
++
++    def test_expired_delayed_fill_cannot_trade(self):
++        bt = Backtester(Config(), MeanReversionStrategy(), {PAIR: context().candles[PAIR]})
++        bt._fill(self.approve().approved[0], reference_price=100, ts=121 * STEP, source="open")
++        self.assertEqual(bt.trades, [])
++
++    def test_backtest_binds_real_configuration(self):
++        strategy = ScoredMeanReversionStrategy()
++        cfg = Config(taker_fee=.002)
++        Backtester(cfg, strategy, {PAIR: context().candles[PAIR]})
++        self.assertIs(strategy._cfg, cfg)
++
++
++if __name__ == "__main__":
++    unittest.main()
