@@ -631,7 +631,7 @@ class TradingEngine:
             self._adopt_unknown_short(short)
 
     def _adopt_unknown_short(self, short: Any) -> None:
-        """恢复交易所空头，保留真实开仓时间和本地止损。"""
+        """Adopt a venue-held short, keeping the real open time and the local stop."""
         pair = getattr(short, "pair", "")
         quantity = float(getattr(short, "quantity", 0.0) or 0.0)
         if not pair or not math.isfinite(quantity) or quantity <= 0:
@@ -651,7 +651,7 @@ class TradingEngine:
 
         position = self.book.get(pair)
 
-        # 已有空头：同步交易所字段，保留原有止损。
+        # Already short: sync the venue's fields, keep the local stop.
         if position is not None and position.is_short:
             before = {
                 "quantity": position.quantity,
@@ -685,7 +685,7 @@ class TradingEngine:
                 )
             return
 
-        # 同一币对已有多头，不能直接用空头覆盖。
+        # The book already holds a long for this pair; a short must not overwrite it.
         if position is not None:
             log.error(
                 "%s: venue reports a short while the book holds a long",
@@ -696,7 +696,7 @@ class TradingEngine:
             )
             return
 
-        # 新恢复的空头：使用交易所开仓时间。
+        # Newly adopted short: take the venue's open time.
         if not math.isfinite(entry) or entry <= 0:
             ticker = self.tickers.get(pair)
             entry = ticker.mid if ticker is not None else 0.0
