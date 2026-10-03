@@ -199,16 +199,40 @@ def run_check(cfg) -> int:
 # ---------------------------------------------------------------------------
 
 
+def discover_seed_paths(data_dir: str, interval: str) -> dict[str, str]:
+    """Every ``<COIN>-<UNIT>_<interval>.csv`` in ``data_dir``, keyed by pair.
+
+    Scanning the directory instead of the configured pair list is deliberate.
+    Rule 1 chooses the universe from 24h turnover on every bar, so the traded
+    pairs are not known until the venue has been contacted; seeding only the
+    configured ones both bypasses that ranking and silently starves the warm-up
+    whenever the two disagree. That is what used to happen by default, because
+    ``ROOSTOO_PAIRS`` ships empty.
+
+    Handing over a broader set than necessary is safe: ``engine.seed_history``
+    skips any pair the venue does not list and re-checks each file's last close
+    against the live mid before using it.
+
+    ``sample_*.csv`` files are synthetic fixtures for the tests, not history.
+    """
+    out: dict[str, str] = {}
+    suffix = f"_{interval}.csv"
+    for path in sorted(Path(data_dir).glob(f"*-*{suffix}")):
+        if path.name.startswith("sample_"):
+            continue
+        stem = path.name[: -len(suffix)]
+        coin, _, unit = stem.partition("-")
+        if coin and unit:
+            out[f"{coin.upper()}/{unit.upper()}"] = str(path)
+    return out
+
+
 def build_engine(cfg, seed: bool, data_dir: str, interval: str) -> TradingEngine:
     client = build_client(cfg)
     journal = Journal(cfg.journal_dir)
     seed_paths: dict[str, str] = {}
     if seed:
-        base = Path(data_dir)
-        for pair in cfg.resolved_pairs():
-            path = base / f"{pair.replace('/', '-')}_{interval}.csv"
-            if path.is_file():
-                seed_paths[pair] = str(path)
+        seed_paths = discover_seed_paths(data_dir, interval)
     return TradingEngine(cfg, client=client, journal=journal, seed_paths=seed_paths)
 
 
