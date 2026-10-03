@@ -363,22 +363,31 @@ class TestIncompleteBalanceSnapshotIsNotActedOn(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-class TestGrossBudgetIsFreedBySameBatchExits(unittest.TestCase):
-    """Rule 10 freed the slot but Rule 9 kept rejecting the entry."""
+class TestExitsReleaseCapacityOnlyAfterTheyFill(unittest.TestCase):
+    """An approved exit used to free its slot and its gross exposure immediately,
+    so a later entry in the same batch could spend capacity a still-open position
+    held. The approval is not the fill: if the exit failed, the account breached
+    Rule 9 or Rule 10. Capacity is now released by the next cycle, once the
+    position is genuinely gone from the book.
+    """
 
     HELD = ("BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD")
     NEW = "ADA/USD"
 
-    def _view(self) -> PortfolioView:
+    def _view(self, held: tuple[str, ...] | None = None) -> PortfolioView:
         # 4 x 15% == exactly the 60% gross cap.
         positions = {
-            p: Position(pair=p, quantity=150.0, avg_price=100.0, mark_price=100.0) for p in self.HELD
+            p: Position(pair=p, quantity=150.0, avg_price=100.0, mark_price=100.0)
+            for p in (self.HELD if held is None else held)
         }
         return PortfolioView(nav=100_000.0, cash_usd=40_000.0, positions=positions)
 
-    def test_an_exit_earlier_in_the_batch_frees_capital_for_a_later_entry(self) -> None:
+    def _risk(self) -> RiskManager:
         cfg = make_config(Path(tempfile.gettempdir()))
-        risk = RiskManager(cfg, PositionSizer(cfg))
+        return RiskManager(cfg, PositionSizer(cfg))
+
+    def test_an_entry_cannot_spend_an_unfilled_exits_capacity(self) -> None:
+        risk = self._risk()
         tickers = {p: ticker(p) for p in self.HELD + (self.NEW,)}
 
         decision = risk.evaluate(
@@ -392,17 +401,32 @@ class TestGrossBudgetIsFreedBySameBatchExits(unittest.TestCase):
             bar_idx=1,
         )
         approved = {a.pair: a.action for a in decision.approved}
-        self.assertEqual(approved.get("BTC/USD"), EXIT_LONG)
-        self.assertEqual(
-            approved.get(self.NEW),
-            ENTER_LONG,
-            f"the exit freed a slot and 15k of gross, but the entry was still rejected: {decision.rejected}",
+        self.assertEqual(approved.get("BTC/USD"), EXIT_LONG, "the exit itself must still be approved")
+        self.assertNotIn(
+            self.NEW,
+            approved,
+            "the entry was sized against capacity an unfilled exit still holds",
         )
 
+    def test_capacity_is_available_once_the_position_is_gone(self) -> None:
+        """The next cycle: the exit filled, the book shrank, the slot is free."""
+        risk = self._risk()
+        tickers = {p: ticker(p) for p in self.HELD + (self.NEW,)}
+        remaining = tuple(p for p in self.HELD if p != "BTC/USD")
+
+        decision = risk.evaluate(
+            [Signal(self.NEW, ENTER_LONG, meta={"atr": 1.0})],
+            view=self._view(remaining),
+            tickers=tickers,
+            now_ms=0,
+            bar_idx=1,
+        )
+        approved = {a.pair: a.action for a in decision.approved}
+        self.assertEqual(approved.get(self.NEW), ENTER_LONG, f"rejected: {decision.rejected}")
+
     def test_a_batch_cannot_overshoot_the_gross_cap(self) -> None:
-        """The fix must free budget *without* letting a batch exceed Rule 9."""
-        cfg = make_config(Path(tempfile.gettempdir()))
-        risk = RiskManager(cfg, PositionSizer(cfg))
+        """Unchanged guarantee: a batch never exceeds Rule 9 or Rule 10."""
+        risk = self._risk()
         pairs = ["A/USD", "B/USD", "C/USD", "D/USD", "E/USD"]
         tickers = {p: ticker(p) for p in pairs}
         view = PortfolioView(nav=100_000.0, cash_usd=100_000.0, positions={})
@@ -415,8 +439,8 @@ class TestGrossBudgetIsFreedBySameBatchExits(unittest.TestCase):
             bar_idx=1,
         )
         total = sum(a.notional for a in decision.approved if a.is_entry)
-        self.assertLessEqual(total, 100_000.0 * cfg.max_gross_exposure + 1e-6)
-        self.assertLessEqual(len(decision.approved), cfg.max_open_positions)
+        self.assertLessEqual(total, 100_000.0 * risk.cfg.max_gross_exposure + 1e-6)
+        self.assertLessEqual(len(decision.approved), risk.cfg.max_open_positions)
 
 
 # ---------------------------------------------------------------------------
@@ -660,20 +684,56 @@ class TestStateScopeIsolation(unittest.TestCase):
             self.assertTrue(book.load())
             self.assertIn(PAIR, book.positions)
 
-    def test_a_refused_book_can_still_be_replaced(self) -> None:
-        """Refusing to load is not refusing to save. If the stale file could not be
-        overwritten, the wrong-venue state would sit there forever."""
+    def test_a_refused_book_is_not_overwritten(self) -> None:
+        """The reviewer's finding: refusing to *load* is not enough while the file
+        stays writable. A mock run used to replace the live book, and the live cost
+        basis and stop levels were then gone for good."""
         with scratch_dir() as d:
             path = d / "positions.json"
-            self._write_scoped(path, {"mode": "mock", "venue": "elsewhere"})
-            cfg = make_config(d)
-            cfg.mock = False
+            self._write_scoped(path, {"mode": "live", "venue": "https://api.example.com"})
+            before = path.read_bytes()
+
+            cfg = make_config(d)  # mock
             book = PositionBook(path, cfg=cfg)
             self.assertFalse(book.load())
             book.save()
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(payload.get("scope"), cfg.state_scope)
-            self.assertEqual(payload["positions"], {})
+
+            self.assertEqual(
+                path.read_bytes(), before, "another runtime's book was overwritten"
+            )
+
+    def test_live_state_survives_a_mock_run_in_the_same_journal_dir(self) -> None:
+        """live -> mock -> live, the round trip the review asked for.
+
+        The two runtimes must not share a state file at all, so a mock run cannot
+        touch the live book even in principle."""
+        with scratch_dir() as d:
+            live = make_config(d)
+            live.mock = False
+            sim = make_config(d)  # mock = True
+
+            live_path = d / live.state_dir_name / "positions.json"
+            mock_path = d / sim.state_dir_name / "positions.json"
+            self.assertNotEqual(live_path, mock_path, "mock and live share a state file")
+
+            live_book = PositionBook(live_path, cfg=live)
+            live_book.load()
+            live_book.positions[PAIR] = Position(
+                pair=PAIR, quantity=0.5, avg_price=60_000.0, mark_price=61_000.0, stop_price=57_000.0
+            )
+            live_book.save()
+
+            # A mock run in the same JOURNAL_DIR.
+            mock_book = PositionBook(mock_path, cfg=sim)
+            mock_book.load()
+            mock_book.save()
+
+            # live comes back and must still know its cost basis and its stop.
+            revived = PositionBook(live_path, cfg=live)
+            self.assertTrue(revived.load(), "the live book disappeared after a mock run")
+            self.assertIn(PAIR, revived.positions)
+            self.assertEqual(revived.positions[PAIR].stop_price, 57_000.0)
+            self.assertEqual(revived.positions[PAIR].avg_price, 60_000.0)
 
     def test_a_book_without_a_config_is_unaffected(self) -> None:
         """Tests and tools construct PositionBook(path) with no cfg; the check must
@@ -1093,6 +1153,181 @@ class TestUnknownOrderReconciliationDoesNotInventFills(unittest.TestCase):
             self.assertEqual(engine.book.positions, {}, "FILLED with nothing filled was booked anyway")
 
 
+class UnknownOrderClient:
+    """Reports a chosen coin balance and no pending orders, and can reveal a fill."""
+
+    def __init__(self, coin_free: float = 0.0, order_rows: list | None = None,
+                 pending: dict | None = None) -> None:
+        self.coin_free = coin_free
+        self._order_rows = list(order_rows or [])
+        self._pending = dict(pending or {})
+
+    def sync_time(self) -> int:
+        return 0
+
+    def exchange_info(self) -> ExchangeInfo:
+        return ExchangeInfo(is_running=True, initial_wallet={"USD": 100_000.0}, pairs={PAIR: trade_pair()})
+
+    def ticker(self, pair: str | None = None) -> dict:
+        return {PAIR: ticker(PAIR)}
+
+    def balance(self) -> dict:
+        return {
+            "USD": WalletBalance(asset="USD", free=100_000.0, locked=0.0),
+            "BTC": WalletBalance(asset="BTC", free=self.coin_free, locked=0.0),
+        }
+
+    def pending_count(self) -> tuple[int, dict]:
+        if not self._pending:
+            return 0, {}
+        return sum(self._pending.values()), dict(self._pending)
+
+    def place_order(self, *args, **kwargs):
+        raise AssertionError("no orders expected")
+
+    def query_orders(self, **kwargs) -> list:
+        return list(self._order_rows)
+
+    def cancel_order(self, *args, **kwargs) -> list:
+        return []
+
+    def short_positions(self) -> list:
+        return []
+
+
+class TestUnknownOrderKeepsItsStop(unittest.TestCase):
+    """An order whose outcome the venue never confirmed used to be forgotten.
+
+    The fill then surfaced days later through the balance reconciliation, which
+    adopted the position with no cost basis and no stop -- and with the time stop
+    disabled, nothing else would ever have closed it.
+    """
+
+    def _action(self, stop: float | None = 57_000.0) -> ApprovedAction:
+        return ApprovedAction(
+            pair=PAIR, action=ENTER_LONG, quantity=0.5, notional=30_000.0,
+            reason="test", stop_price=stop,
+        )
+
+    def _unknown(self) -> OrderResult:
+        return OrderResult(
+            pair=PAIR, side="BUY", order_type="MARKET", quantity=0.5,
+            price=0.0, status="UNKNOWN", err_msg="timeout",
+        )
+
+    def _intent(self, stop: float | None = 57_000.0) -> dict:
+        return {
+            "action": ENTER_LONG, "side": "BUY", "quantity": 0.5,
+            "notional": 30_000.0, "stop_price": stop,
+            "sent_ms": int(time.time() * 1000), "attempts": 0,
+        }
+
+    def _balances(self, coin_free: float) -> dict:
+        return {
+            "USD": WalletBalance(asset="USD", free=100_000.0, locked=0.0),
+            "BTC": WalletBalance(asset="BTC", free=coin_free, locked=0.0),
+        }
+
+    def test_an_unresolved_order_is_remembered_with_its_stop(self) -> None:
+        with scratch_dir() as d:
+            engine = make_engine(d, UnknownOrderClient())
+            self.addCleanup(engine.journal.close)
+            engine._record_result(self._unknown(), self._action(), int(time.time() * 1000), 1)
+
+            intent = engine._unknown_intents.get(PAIR)
+            self.assertIsNotNone(intent, "an unresolved order was dropped on the floor")
+            self.assertEqual(intent["stop_price"], 57_000.0)
+            self.assertEqual(intent["side"], "BUY")
+
+    def test_the_intent_survives_a_restart(self) -> None:
+        """A transport failure is exactly when the process gets restarted before
+        the venue can be asked again."""
+        with scratch_dir() as d:
+            engine = make_engine(d, UnknownOrderClient())
+            engine._ready = True
+            engine._record_result(self._unknown(), self._action(), int(time.time() * 1000), 1)
+            self.assertIn(PAIR, engine._unknown_intents)
+            engine._persist()
+            engine.journal.close()
+
+            revived = make_engine(d, UnknownOrderClient())
+            self.addCleanup(revived.journal.close)
+            revived._load_risk_state()
+
+            self.assertIn(PAIR, revived._unknown_intents, "a restart forgot the order")
+            self.assertEqual(revived._unknown_intents[PAIR]["stop_price"], 57_000.0)
+
+    def test_a_late_retry_still_matches_the_original_send_time(self) -> None:
+        """The history query only accepts a row created near the request, so a
+        retry anchored on 'now' can never match once two minutes have passed."""
+        now = int(time.time() * 1000)
+        old_send = now - 600_000  # ten minutes ago
+        row = {
+            "CreateTimestamp": old_send + 500,
+            "Side": "BUY",
+            "Status": "FILLED",
+            "Quantity": 0.5,
+            "FilledQuantity": 0.5,
+            "FilledAverPrice": 60_000.0,
+            "OrderID": 11,
+        }
+        with scratch_dir() as d:
+            engine = make_engine(d, UnknownOrderClient(order_rows=[row]))
+            self.addCleanup(engine.journal.close)
+
+            self.assertIsNone(
+                engine._reconcile_unknown_order(self._action(), self._unknown(), now),
+                "a ten-minute-old row must not match a now-anchored query",
+            )
+            self.assertIsNotNone(
+                engine._reconcile_unknown_order(
+                    self._action(), self._unknown(), now, sent_ms=old_send
+                ),
+                "anchoring on the send time must find the row",
+            )
+
+    def test_the_remembered_stop_is_restored_when_the_holding_is_adopted(self) -> None:
+        with scratch_dir() as d:
+            engine = make_engine(d, UnknownOrderClient(coin_free=0.5))
+            self.addCleanup(engine.journal.close)
+            engine._unknown_intents[PAIR] = self._intent()
+
+            engine._reconcile_positions(self._balances(0.5), [])
+
+            position = engine.book.get(PAIR)
+            self.assertIsNotNone(position, "the venue's holding was not adopted")
+            self.assertEqual(position.stop_price, 57_000.0, "the adopted position lost its stop")
+            self.assertNotIn(PAIR, engine._unknown_intents, "the consumed intent should be cleared")
+
+    def test_an_adopted_holding_without_an_intent_has_no_stop(self) -> None:
+        """The residual gap, pinned so it stays a known quantity: nothing can
+        invent a stop for a position this process never ordered."""
+        with scratch_dir() as d:
+            engine = make_engine(d, UnknownOrderClient(coin_free=0.5))
+            self.addCleanup(engine.journal.close)
+
+            engine._reconcile_positions(self._balances(0.5), [])
+
+            position = engine.book.get(PAIR)
+            self.assertIsNotNone(position)
+            self.assertIsNone(position.stop_price)
+
+    def test_an_unresolved_order_keeps_its_slot_and_capital_reserved(self) -> None:
+        """The outcome is unknown, not absent. Releasing the reservation would let
+        the risk layer commit the same money twice on an order that may have filled."""
+        with scratch_dir() as d:
+            engine = make_engine(d, UnknownOrderClient(pending={}))
+            self.addCleanup(engine.journal.close)
+            engine._unknown_intents[PAIR] = self._intent()
+
+            engine._refresh_pending()
+
+            self.assertGreaterEqual(
+                engine._pending_by_pair.get(PAIR, 0), 1, "an unresolved order released its slot"
+            )
+            self.assertGreaterEqual(engine._pending_notional_by_pair.get(PAIR, 0.0), 30_000.0)
+
+
 class TestShortPositionsSurviveATransientError(unittest.TestCase):
     def test_a_failed_query_does_not_delete_the_books_shorts(self) -> None:
         with scratch_dir() as d:
@@ -1253,41 +1488,59 @@ class TestNonFiniteNavCannotDisableTheHalts(unittest.TestCase):
 
 
 class TestMalformedStateCannotStopTheBoot(unittest.TestCase):
+    """A state file the engine cannot parse must not stop it starting.
+
+    These write to the engine's *own* paths rather than a literal filename. State
+    lives in a per-mode subdirectory of JOURNAL_DIR (see Config.state_dir_name), so
+    a hardcoded ``journal/positions.json`` would leave the engine reading nothing
+    and the test asserting a default -- passing while testing nothing at all.
+    """
+
+    @staticmethod
+    def _write_state(engine: TradingEngine, payload: object) -> None:
+        path = engine._state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    @staticmethod
+    def _write_book_file(engine: TradingEngine, payload: object) -> None:
+        path = engine.book.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
     def test_a_wrong_type_in_the_risk_state_is_ignored(self) -> None:
         with scratch_dir() as d:
-            (d / "engine_state.json").write_text(
-                json.dumps({"risk": {"peak_nav": "not-a-number", "last_exit_bar": {"ETH/USD": None}}}),
-                encoding="utf-8",
-            )
             engine = make_engine(d, _StatefulClient())
             self.addCleanup(engine.journal.close)
+            self._write_state(
+                engine,
+                {"risk": {"peak_nav": "not-a-number", "last_exit_bar": {"ETH/USD": None}}},
+            )
             engine._load_risk_state()  # must not raise
             self.assertEqual(engine.risk.peak_nav, 0.0)
             self.assertEqual(engine.risk.last_exit_bar, {})
 
     def test_a_non_object_state_payload_is_ignored(self) -> None:
         with scratch_dir() as d:
-            (d / "engine_state.json").write_text("[]", encoding="utf-8")
             engine = make_engine(d, _StatefulClient())
             self.addCleanup(engine.journal.close)
+            self._write_state(engine, [])
             engine._load_risk_state()
             self.assertEqual(engine.risk.peak_nav, 0.0)
 
     def test_a_bad_position_row_does_not_cost_the_good_ones(self) -> None:
         with scratch_dir() as d:
-            (d / "positions.json").write_text(
-                json.dumps(
-                    {
-                        "positions": {
-                            PAIR: {"quantity": None, "stop_price": "abc"},
-                            "ETH/USD": {"quantity": 1.0, "avg_price": 2.0, "stop_price": 1.5},
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
             engine = make_engine(d, _StatefulClient())
             self.addCleanup(engine.journal.close)
+            self._write_book_file(
+                engine,
+                {
+                    "positions": {
+                        PAIR: {"quantity": None, "stop_price": "abc"},
+                        "ETH/USD": {"quantity": 1.0, "avg_price": 2.0, "stop_price": 1.5},
+                    }
+                },
+            )
             self.assertTrue(engine.book.load())
             self.assertNotIn(PAIR, engine.book.positions, "an empty row was restored as a position")
             restored = engine.book.get("ETH/USD")
@@ -1296,12 +1549,12 @@ class TestMalformedStateCannotStopTheBoot(unittest.TestCase):
 
     def test_a_non_numeric_stop_level_is_dropped_not_kept_as_a_string(self) -> None:
         with scratch_dir() as d:
-            (d / "positions.json").write_text(
-                json.dumps({"positions": {"ETH/USD": {"quantity": 1.0, "avg_price": 2.0, "stop_price": "abc"}}}),
-                encoding="utf-8",
-            )
             engine = make_engine(d, _StatefulClient())
             self.addCleanup(engine.journal.close)
+            self._write_book_file(
+                engine,
+                {"positions": {"ETH/USD": {"quantity": 1.0, "avg_price": 2.0, "stop_price": "abc"}}},
+            )
             self.assertTrue(engine.book.load())
             position = engine.book.get("ETH/USD")
             self.assertIsNotNone(position)
@@ -1368,6 +1621,11 @@ class HaltClient:
         #: Whether the venue still reports the coin. Reconciliation re-adopts from
         #: this, so clearing the local book is not enough to make it flat.
         self.hold = hold
+        self.cancelled: list = []
+        self.cancel_raises = False
+        self.pending_raises = False
+        #: Orders the venue knows about but the local table may not.
+        self.venue_pending: dict = {}
 
     def sync_time(self) -> int:
         return 0
@@ -1386,7 +1644,11 @@ class HaltClient:
         }
 
     def pending_count(self) -> tuple[int, dict]:
-        return 0, {}
+        if self.pending_raises:
+            raise RuntimeError("simulated pending-count outage")
+        if not self.venue_pending:
+            return 0, {}
+        return sum(self.venue_pending.values()), dict(self.venue_pending)
 
     def place_order(self, *args, **kwargs):
         self.orders.append((args, kwargs))
@@ -1400,6 +1662,11 @@ class HaltClient:
         return []
 
     def cancel_order(self, *args, **kwargs) -> list:
+        if self.cancel_raises:
+            raise RuntimeError("simulated cancel failure")
+        pair = kwargs.get("pair")
+        if pair:
+            self.cancelled.append(pair)
         return []
 
     def short_positions(self) -> list:
@@ -1480,6 +1747,55 @@ class TestHaltDoesNotAbandonOpenPositions(unittest.TestCase):
             self.assertEqual(engine.book.held(), {})
             self.assertEqual(engine._halt_flatten_failures, 0)
             self.assertTrue(engine._shutting_down)
+
+    def test_a_resting_entry_order_stops_the_halt_from_finishing(self) -> None:
+        """The reviewer's case: no position, but a live buy order.
+
+        Exiting here leaves the order to fill with nothing managing the result --
+        and the exit status is what stops systemd restarting.
+        """
+        with scratch_dir() as d:
+            engine = self._engine(d, hold=False)  # nothing held, nothing at the venue
+            engine._resting[PAIR] = (0, 59_000.0)  # but a bid is resting
+            engine.step()
+
+            self.assertEqual(engine.client.cancelled, [PAIR], "the resting entry was not cancelled")
+            self.assertNotIn(PAIR, engine._resting)
+            self.assertTrue(engine._shutting_down, "with a genuinely clean account the halt may finish")
+
+    def test_a_failed_cancel_keeps_the_halt_alive(self) -> None:
+        with scratch_dir() as d:
+            engine = self._engine(d, hold=False)
+            engine.client.cancel_raises = True
+            engine._resting[PAIR] = (0, 59_000.0)
+            engine.step()
+
+            self.assertIn(PAIR, engine._resting, "a failed cancel must not be assumed to have happened")
+            self.assertFalse(
+                engine._shutting_down, "the engine finished with an order it could not cancel"
+            )
+
+    def test_a_venue_order_stops_the_halt_from_finishing(self) -> None:
+        """An order that survives in the venue but not in the local table is still
+        an order, and it is exactly what a restart leaves behind."""
+        with scratch_dir() as d:
+            engine = self._engine(d, hold=False)
+            engine.client.venue_pending = {PAIR: 1}
+            engine.step()
+
+            self.assertFalse(
+                engine._shutting_down, "the engine finished while the venue still held an order"
+            )
+
+    def test_an_unanswered_pending_query_keeps_the_halt_alive(self) -> None:
+        """An unanswered question is not a negative answer: assuming the venue holds
+        nothing is how an order gets orphaned."""
+        with scratch_dir() as d:
+            engine = self._engine(d, hold=False)
+            engine.client.pending_raises = True
+            engine.step()
+
+            self.assertFalse(engine._shutting_down)
 
 
 if __name__ == "__main__":
