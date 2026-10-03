@@ -426,7 +426,7 @@ roostoo/
   engine.py       the autonomous decision loop
   journal.py      append-only audit trail (JSONL + trades.csv)
   backtest.py     event-driven backtester sharing the live objects
-tests/            431 unittest cases, stdlib only
+tests/            462 unittest cases, stdlib only
 docs/SECURITY.md  how credentials are handled, and what to do if one leaks
 ```
 
@@ -438,7 +438,7 @@ pre-commit hook, `scripts/publish.ps1` and a `secret-scan` CI job - all describe
 ## 12. Tests and continuous integration
 
 ```bash
-python -m unittest discover -s tests -t .     # 431 tests, no network, no sleeping
+python -m unittest discover -s tests -t .     # 462 tests, no network, no sleeping
 ```
 
 Includes the HMAC signature reproduced byte-for-byte from Roostoo's published test

@@ -385,6 +385,20 @@ class Config:
         """
         return {"mode": "mock" if self.mock else "live", "venue": self.base_url}
 
+    @property
+    def state_dir_name(self) -> str:
+        """Directory *inside* ``JOURNAL_DIR`` holding this runtime's state files.
+
+        A stamp alone is not isolation. ``mock`` and ``live`` share
+        ``JOURNAL_DIR`` by default, and a file whose stamp did not match used to be
+        refusable for *reading* while remaining perfectly overwritable -- so a mock
+        run replaced the live book, and the live cost basis and stop levels were
+        gone for good. One directory per mode means a runtime never opens another
+        runtime's state in the first place. The venue distinction is still carried
+        by the stamp, which now also blocks writes.
+        """
+        return self.state_scope["mode"]
+
     def resolved_pairs(self) -> tuple[str, ...]:
         """Explicit universe, normalised to ``BASE/QUOTE`` form."""
         out = []

@@ -177,6 +177,9 @@ class PositionBook:
         #: Set only by a *successful* ``load()``. See ``save()`` for why the
         #: difference between "loaded and empty" and "never loaded" matters.
         self._load_attempted = False
+        #: Set when the file on disk belongs to another runtime. Blocks writes as
+        #: well as reads: see ``Config.state_dir_name``.
+        self._scope_conflict = False
 
     def lot_for(self, pair: str) -> float:
         """Smallest tradable increment, when a config with venue info is available."""
@@ -307,6 +310,13 @@ class PositionBook:
     def save(self) -> None:
         if not self.path:
             return
+        if self._scope_conflict:
+            log.error(
+                "not saving the position book at %s: it belongs to another runtime, and "
+                "overwriting it would destroy that runtime's positions and stops",
+                self.path,
+            )
+            return
         # Never let an empty in-memory book overwrite a real file on disk. The
         # engine loads state at the very start of bootstrap(); if that never ran
         # -- a network blip, an exception before load, a partial startup -- then
@@ -346,15 +356,19 @@ class PositionBook:
         mismatch = self._scope_mismatch(payload)
         if mismatch is not None:
             saved, current = mismatch
+            # Refuse to load *and* refuse to overwrite. Loading another runtime's
+            # book imports its positions and stops; overwriting it destroys them.
+            # The second half was the bug: a file that was merely refused for
+            # reading stayed perfectly writable, so a mock run wiped the live book
+            # and the live cost basis and stop levels were gone for good.
+            self._scope_conflict = True
             log.error(
-                "refusing to load the position book at %s: it was written by %s, this "
-                "process is %s. Starting flat so one venue's positions and stops are not "
-                "adopted by another. Point JOURNAL_DIR elsewhere, or delete the file, if "
-                "switching venues is what you intended.",
+                "refusing to load or overwrite the position book at %s: it was written by "
+                "%s, this process is %s. Move or delete the file if switching venues is "
+                "what you intended.",
                 self.path, saved, current,
             )
             self.positions = {}
-            self._load_attempted = True  # we did look; a flat book may now replace it
             return False
         self.positions = {}
         for pair, row in (payload.get("positions") or {}).items():
@@ -858,8 +872,14 @@ class RiskManager:
                         meta=dict(signal.meta),
                     )
                 )
-                projected_pairs.discard(pair)
-                projected_gross -= abs(position.notional)
+                # An approved exit does NOT free its slot or its exposure in the
+                # same batch. It used to -- the pair was dropped from the
+                # projection so a later entry could spend the capacity -- but the
+                # approval is not the fill: if the exit then failed, the entry had
+                # already been sized against a position that was still open, and
+                # the account breached Rule 9 or Rule 10. Capacity is released by
+                # the next cycle instead, once the exit has filled and the
+                # position is genuinely gone from the book.
                 continue
 
             # --- entries -------------------------------------------------
