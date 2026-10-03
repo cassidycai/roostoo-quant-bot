@@ -129,17 +129,28 @@ python3 -c "from roostoo.journal import read_events; print(len(read_events('jour
   Watch the `cycle`/`trade` counts in the journal rather than the leaderboard; a
   stalled bot looks identical to a flat one from the outside.
 * **To iterate a strategy**, commit the change, redeploy, then restart. The
-  position book and risk state are restored from `journal/`, so a restart does not
-  lose stops or cooldowns.
+  position book and risk state are restored from `journal/<mode>/` (see below), so
+  a restart does not lose stops or cooldowns.
 * **Emergency stop that keeps positions:** `sudo systemctl stop roostoo-bot`.
 * **The kill switch halting is normal, not a crash.** When `MAX_DRAWDOWN_PCT` is
-  breached the bot flattens, persists `halted: true` and exits with status `3`,
-  which the unit declares a clean stop (`SuccessExitStatus=3`) so
-  `Restart=always` does not restart it. `systemctl status` will say
-  `inactive (dead)` and the journal contains the halt reason. Restarting cannot
-  help -- clear it by setting `"halted": false` in `journal/engine_state.json`,
-  and only after understanding why the drawdown happened. A genuine crash exits
-  with any other status and is still restarted.
+  breached the bot cancels its entry orders, flattens, persists `halted: true` and
+  exits with status `3`, which the unit declares a clean stop
+  (`SuccessExitStatus=3`) so `Restart=always` does not restart it. It keeps running
+  until the account is genuinely clean -- no position, no venue order -- so a
+  halted bot with an order it could not cancel stays up and logs
+  `halted but not finished`. `systemctl status` will then say `active`, not
+  `inactive (dead)`, and the journal holds the halt reason. Restarting cannot help
+  -- clear it by setting `"halted": false` in
+  **`journal/live/engine_state.json`** (the simulator uses `journal/mock/`), and
+  only after understanding why the drawdown happened. A genuine crash exits with
+  any other status and is still restarted.
+* **State lives in a per-mode subdirectory.** `journal/live/` and `journal/mock/`
+  each hold their own `positions.json` and `engine_state.json`, so a simulator run
+  cannot overwrite the live book. Upgrading from a version that wrote
+  `journal/positions.json` migrates those files into the right subdirectory on the
+  first live start and leaves a `*.pre-migration` backup beside the original. A
+  mock run deliberately leaves unstamped legacy state alone, so smoke-testing
+  before a real start cannot take the live book with it.
 * **Emergency stop that closes the book:** stop the service FIRST, then flatten.
   Running it while the unit is up leaves two writers on the same account and the
   same `journal/*.tmp` files. Also note that `--cycles 1` still runs one full
