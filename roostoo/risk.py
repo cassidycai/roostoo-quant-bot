@@ -194,8 +194,37 @@ class PositionBook:
             if ticker is not None and ticker.mid > 0:
                 position.update_mark(ticker.mid)
 
-    def apply_spot_buy(self, pair: str, quantity: float, price: float, ts_ms: int, stop_price: Optional[float] = None) -> Position:
+    def has_applied(self, pair: str, order_id: Optional[str]) -> bool:
+        """Has this venue order already been booked into the position?
+
+        Lets the caller skip the whole bookkeeping path -- not just the quantity --
+        so a replayed fill cannot also double the trade log or the counters.
+        """
+        if not order_id:
+            return False
         position = self.positions.get(pair)
+        return position is not None and str(order_id) in position.applied_order_ids
+
+    def apply_spot_buy(
+        self,
+        pair: str,
+        quantity: float,
+        price: float,
+        ts_ms: int,
+        stop_price: Optional[float] = None,
+        order_id: Optional[str] = None,
+    ) -> Position:
+        position = self.positions.get(pair)
+        if position is not None and order_id and str(order_id) in position.applied_order_ids:
+            # Applying the same fill twice doubles the position and the exposure the
+            # risk layer then sees. This is not hypothetical: the intent retry reads
+            # the venue history, so a fill booked normally can be presented again.
+            log.warning(
+                "%s: order %s was already applied to this position; ignoring the repeat",
+                pair,
+                order_id,
+            )
+            return position
         if position is None or position.is_short:
             position = Position(pair=pair, opened_ts_ms=ts_ms)
             self.positions[pair] = position
@@ -206,23 +235,52 @@ class PositionBook:
         position.mark_price = price
         position.peak_price = max(position.peak_price, price)
         position.stop_price = stop_price if stop_price is not None else position.stop_price
+        if order_id:
+            position.applied_order_ids = (*position.applied_order_ids, str(order_id))[-32:]
         return position
 
-    def apply_spot_sell(self, pair: str, quantity: float, price: float) -> Optional[Position]:
+    def apply_spot_sell(
+        self, pair: str, quantity: float, price: float, order_id: Optional[str] = None
+    ) -> Optional[Position]:
         position = self.positions.get(pair)
         if position is None:
+            # A repeat of a sell that already closed the position finds nothing to
+            # sell, which is idempotent by construction.
             return None
+        if order_id and str(order_id) in position.applied_order_ids:
+            log.warning(
+                "%s: order %s was already applied to this position; ignoring the repeat",
+                pair,
+                order_id,
+            )
+            return position
         position.quantity = max(0.0, position.quantity - quantity)
         position.mark_price = price
+        if order_id:
+            position.applied_order_ids = (*position.applied_order_ids, str(order_id))[-32:]
         if position.quantity <= 1e-12:
             self.positions.pop(pair, None)
             return None
         return position
 
     def apply_short_open(
-        self, pair: str, quantity: float, entry_price: float, collateral: float, ts_ms: int, stop_price: Optional[float] = None
+        self,
+        pair: str,
+        quantity: float,
+        entry_price: float,
+        collateral: float,
+        ts_ms: int,
+        stop_price: Optional[float] = None,
+        order_id: Optional[str] = None,
     ) -> Position:
         position = self.positions.get(pair)
+        if position is not None and order_id and str(order_id) in position.applied_order_ids:
+            log.warning(
+                "%s: order %s was already applied to this position; ignoring the repeat",
+                pair,
+                order_id,
+            )
+            return position
         if position is None or not position.is_short:
             position = Position(pair=pair, is_short=True, opened_ts_ms=ts_ms)
             self.positions[pair] = position
@@ -234,6 +292,8 @@ class PositionBook:
         position.mark_price = entry_price
         position.peak_price = entry_price
         position.stop_price = stop_price if stop_price is not None else position.stop_price
+        if order_id:
+            position.applied_order_ids = (*position.applied_order_ids, str(order_id))[-32:]
         return position
 
     def apply_short_close(self, pair: str, quantity: float, price: float) -> Optional[Position]:
@@ -270,6 +330,7 @@ class PositionBook:
                     "take_profit_price": pos.take_profit_price,
                     "peak_price": pos.peak_price,
                     "opened_ts_ms": pos.opened_ts_ms,
+                    "applied_order_ids": list(pos.applied_order_ids),
                 }
                 for pair, pos in self.positions.items()
             }
@@ -397,6 +458,11 @@ class PositionBook:
                     take_profit_price=_as_optional_finite(row.get("take_profit_price")),
                     peak_price=_as_finite_float(row.get("peak_price"), 0.0),
                     opened_ts_ms=int(_as_finite_float(row.get("opened_ts_ms"), 0.0)),
+                    applied_order_ids=tuple(
+                        str(x)
+                        for x in (row.get("applied_order_ids") or [])
+                        if isinstance(x, (str, int))
+                    )[-32:],
                 )
             except Exception as exc:
                 # One unreadable row must not cost us the whole book -- the other

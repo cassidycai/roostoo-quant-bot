@@ -151,6 +151,13 @@ python3 -c "from roostoo.journal import read_events; print(len(read_events('jour
   first live start and leaves a `*.pre-migration` backup beside the original. A
   mock run deliberately leaves unstamped legacy state alone, so smoke-testing
   before a real start cannot take the live book with it.
+* **Re-fetch history before a restart you expect to be long.** The seed is refused
+  when the CSV's last bar is more than 48 bars (24h) old, when the last bar has not
+  closed yet, or when the series contains a hole -- warming a closed-bar strategy
+  with disjoint history makes the first signals read a distribution that no longer
+  exists. The bot then starts cold and needs 24h of uptime before Rules 2-3 can
+  fire, so run `python3 fetch_history.py` first. The journal records
+  `seed_rejected` with the reason, and the log says which pair it was.
 * **Emergency stop that closes the book:** stop the service FIRST, then flatten.
   Running it while the unit is up leaves two writers on the same account and the
   same `journal/*.tmp` files. Also note that `--cycles 1` still runs one full

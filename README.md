@@ -426,7 +426,7 @@ roostoo/
   engine.py       the autonomous decision loop
   journal.py      append-only audit trail (JSONL + trades.csv)
   backtest.py     event-driven backtester sharing the live objects
-tests/            469 unittest cases, stdlib only
+tests/            481 unittest cases, stdlib only
 docs/SECURITY.md  how credentials are handled, and what to do if one leaks
 ```
 
@@ -438,13 +438,18 @@ pre-commit hook, `scripts/publish.ps1` and a `secret-scan` CI job - all describe
 ## 12. Tests and continuous integration
 
 ```bash
-python -m unittest discover -s tests -t .     # 469 tests, no network, no sleeping
+python -m unittest discover -s tests -t .     # 481 tests, no network, no sleeping
 ```
 
 Includes the HMAC signature reproduced byte-for-byte from Roostoo's published test
 vector - the failure mode that would otherwise cost a day of the competition to
 diagnose on live keys - and `tests/test_state_safety.py`, which pins the guarantees
 that a bad startup or a malformed balance response cannot destroy the stored book.
+Unreadable state is handled explicitly rather than by luck: a row or field the
+engine cannot parse is dropped and the run continues on defaults instead of
+refusing to start, but a book that was never successfully loaded is never
+overwritten, and state belonging to another run mode or venue is refused for
+writing as well as reading.
 
 CI runs on every push and pull request: the unit suite on Python 3.10 and 3.13, a
 compile pass, a check that all text files are BOM-free UTF-8 with no re-encoding

@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 import uuid
 from pathlib import Path
 from typing import Iterator
@@ -40,6 +41,7 @@ from roostoo.engine import (  # noqa: E402
     ORDER_FILLED,
     ORDER_NOT_FILLED,
     ORDER_UNKNOWN,
+    SEED_MAX_GAP_BARS,
     TradingEngine,
 )
 from roostoo.models import (  # noqa: E402
@@ -1948,6 +1950,275 @@ class TestHaltDoesNotAbandonOpenPositions(unittest.TestCase):
             engine.step()
 
             self.assertFalse(engine._shutting_down)
+
+
+class TestAFillIsAppliedExactlyOnce(unittest.TestCase):
+    """The double-count the fourth review found.
+
+    An entry's intent used to survive a normal fill, so the retry path queried the
+    venue history, found the very fill that had just been booked, and applied it
+    again -- doubling the position, the exposure and the NAV the risk layer saw.
+    """
+
+    NOW = 1_700_000_000_000
+
+    def _action(self) -> ApprovedAction:
+        return ApprovedAction(
+            pair=PAIR,
+            action=ENTER_LONG,
+            quantity=0.5,
+            notional=30_000.0,
+            reason="test",
+            stop_price=57_000.0,
+        )
+
+    def _row(self) -> dict:
+        return {
+            "OrderID": 4242,
+            "CreateTimestamp": self.NOW - 1_000,
+            "Side": "BUY",
+            "Status": "FILLED",
+            "Quantity": 0.5,
+            "FilledQuantity": 0.5,
+            "FilledAverPrice": 60_000.0,
+        }
+
+    def _result(self) -> OrderResult:
+        return OrderResult.from_api(
+            PAIR, "BUY", "MARKET", 0.5, {"Success": True, "OrderDetail": self._row()}
+        )
+
+    def _client(self) -> _StatefulClient:
+        return _StatefulClient(order_rows=[self._row()])
+
+    def test_a_settled_fill_clears_its_intent(self) -> None:
+        with scratch_dir() as d:
+            engine = make_engine(d, self._client())
+            self.addCleanup(engine.journal.close)
+            self.assertTrue(engine._write_intent(self._action(), self.NOW))
+
+            engine._record_result(self._result(), self._action(), self.NOW, 1)
+
+            self.assertEqual(engine.book.get(PAIR).quantity, 0.5)
+            self.assertNotIn(PAIR, engine._unknown_intents, "a settled fill kept its intent")
+            self.assertFalse(engine._intent_path(PAIR).is_file(), "the intent outlived the order")
+
+    def test_replaying_the_same_fill_changes_nothing(self) -> None:
+        """The crash window: the book reached disk but the intent was not cleared,
+        so the retry replays the fill the book already holds."""
+        with scratch_dir() as d:
+            engine = make_engine(d, self._client())
+            self.addCleanup(engine.journal.close)
+            engine._write_intent(self._action(), self.NOW)
+            engine._record_result(self._result(), self._action(), self.NOW, 1)
+            entries_after_first = engine.stats.entries
+
+            # Exactly what a crash between `book.save()` and `_forget_intent` leaves.
+            engine._write_intent(self._action(), self.NOW)
+            engine._resolve_unknown_intents(self.NOW, 1)
+
+            self.assertEqual(engine.book.get(PAIR).quantity, 0.5, "the same fill was applied twice")
+            self.assertEqual(
+                engine.stats.entries, entries_after_first, "the replay incremented entries again"
+            )
+            self.assertNotIn(PAIR, engine._unknown_intents)
+
+    def test_the_id_marker_survives_a_restart(self) -> None:
+        """Which is what makes the replay safe across a restart, not just within one
+        process."""
+        with scratch_dir() as d:
+            engine = make_engine(d, self._client())
+            engine._write_intent(self._action(), self.NOW)
+            engine._record_result(self._result(), self._action(), self.NOW, 1)
+            engine.book.save()
+            engine.journal.close()
+
+            revived = make_engine(d, self._client())
+            self.addCleanup(revived.journal.close)
+            revived.book.load()
+            self.assertEqual(revived.book.get(PAIR).quantity, 0.5)
+
+            revived._record_result(self._result(), self._action(), self.NOW, 1)
+
+            self.assertEqual(
+                revived.book.get(PAIR).quantity, 0.5, "a restart re-applied the fill"
+            )
+
+    def test_an_order_the_venue_never_sent_leaves_no_intent(self) -> None:
+        """The P1: the intent was written before the local checks that can still
+        abandon the order, so a request that was never made could reserve capital
+        for ever and block a halt from finishing."""
+        with scratch_dir() as d:
+            client = self._client()
+            engine = make_engine(d, client)
+            self.addCleanup(engine.journal.close)
+            # A notional far below the venue minimum: the local check drops it.
+            action = ApprovedAction(
+                pair=PAIR, action=ENTER_LONG, quantity=1e-9, notional=0.001, reason="test"
+            )
+
+            engine._execute([action], self.NOW, 1)
+
+            self.assertEqual(client.orders_placed, [], "an order was sent after all")
+            self.assertNotIn(PAIR, engine._unknown_intents, "an unsent order left an intent")
+            self.assertFalse(engine._intent_path(PAIR).is_file())
+
+
+class TestIntentFilesAreTheSingleAuthority(unittest.TestCase):
+    """The fourth review's P0-2, exercised through a real `bootstrap()`.
+
+    `_load_unknown_intents` read the intent files and `_load_risk_state` then let
+    engine_state.json replace the whole map -- so a stale snapshot could either
+    erase a brand-new intent (losing the stop) or bring back one whose file had
+    already been deleted (replaying a settled order).
+    """
+
+    NOW = 1_700_000_000_000
+
+    def _action(self) -> ApprovedAction:
+        return ApprovedAction(
+            pair=PAIR,
+            action=ENTER_LONG,
+            quantity=0.5,
+            notional=30_000.0,
+            reason="test",
+            stop_price=57_000.0,
+        )
+
+    @staticmethod
+    def _write_snapshot(engine: TradingEngine, intents: dict) -> None:
+        path = engine._state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "saved_ms": 1_700_000_000_000,
+                    "risk": {"peak_nav": 100_000.0, "halted": False, "last_exit_bar": {}},
+                    "unknown_intents": intents,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_a_stale_snapshot_cannot_erase_a_new_intent(self) -> None:
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient())
+            self.addCleanup(engine.journal.close)
+            self.assertTrue(engine._write_intent(self._action(), self.NOW))
+            # A snapshot saved before that intent existed.
+            self._write_snapshot(engine, {})
+            engine.journal.close()
+
+            revived = make_engine(d, _StatefulClient())
+            self.addCleanup(revived.journal.close)
+            revived.bootstrap()
+
+            self.assertIn(PAIR, revived._unknown_intents, "a stale snapshot erased the new intent")
+            self.assertEqual(revived._unknown_intents[PAIR]["stop_price"], 57_000.0)
+
+    def test_a_settled_intent_is_not_resurrected_by_the_snapshot(self) -> None:
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient())
+            self.addCleanup(engine.journal.close)
+            engine._write_intent(self._action(), self.NOW)
+            engine._forget_intent(PAIR, self.NOW, "settled")
+            # The snapshot still remembers it: the intent directory exists, so this
+            # is a settled record, not an upgrade to migrate.
+            self._write_snapshot(
+                engine, {PAIR: {"stop_price": 57_000.0, "sent_ms": self.NOW, "side": "BUY"}}
+            )
+            engine.journal.close()
+
+            revived = make_engine(d, _StatefulClient())
+            self.addCleanup(revived.journal.close)
+            revived.bootstrap()
+
+            self.assertNotIn(
+                PAIR, revived._unknown_intents, "a settled intent came back from the snapshot"
+            )
+
+    def test_a_genuine_upgrade_still_migrates_the_snapshot(self) -> None:
+        """The one-time path: no intent directory has ever existed, so the snapshot
+        is the only record and must be adopted."""
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient())
+            self.addCleanup(engine.journal.close)
+            self._write_snapshot(
+                engine, {PAIR: {"stop_price": 57_000.0, "sent_ms": self.NOW, "side": "BUY"}}
+            )
+            engine.journal.close()
+
+            revived = make_engine(d, _StatefulClient())
+            self.addCleanup(revived.journal.close)
+            revived.bootstrap()
+
+            self.assertIn(PAIR, revived._unknown_intents, "the upgrade dropped the intent")
+            self.assertEqual(revived._unknown_intents[PAIR]["stop_price"], 57_000.0)
+            self.assertTrue(revived._intent_path(PAIR).is_file(), "not written to its own file")
+
+
+class TestASeedMustBeUsableHistory(unittest.TestCase):
+    """The seed check the third review asked for.
+
+    A closed-bar strategy must not be warmed with a bar that has not closed yet or
+    one dated in the future, and a hole in the series makes every window spanning it
+    compare closes across missing time -- reading the hole as a move. In each case a
+    cold start is the better failure.
+    """
+
+    BAR_MS = 1_800_000
+    NOW = 1_700_000_040_000
+
+    def _engine(self, d: Path) -> TradingEngine:
+        engine = make_engine(d, _StatefulClient())
+        self.addCleanup(engine.journal.close)
+        return engine
+
+    def _series(self, last_ts: int, count: int = 100, step: int = BAR_MS) -> list:
+        return [
+            SimpleNamespace(ts_ms=last_ts - (count - 1 - i) * step, close=60_000.0)
+            for i in range(count)
+        ]
+
+    def test_a_contiguous_closed_series_is_accepted(self) -> None:
+        with scratch_dir() as d:
+            engine = self._engine(d)
+            self.assertIsNone(
+                engine._candle_series_problem(self._series(self.NOW - self.BAR_MS), self.NOW)
+            )
+
+    def test_a_bar_that_has_not_closed_yet_is_refused(self) -> None:
+        with scratch_dir() as d:
+            engine = self._engine(d)
+            problem = engine._candle_series_problem(
+                self._series(self.NOW - self.BAR_MS // 2), self.NOW
+            )
+            self.assertIn("has not closed", problem)
+
+    def test_a_bar_from_the_future_is_refused(self) -> None:
+        with scratch_dir() as d:
+            engine = self._engine(d)
+            problem = engine._candle_series_problem(
+                self._series(self.NOW + self.BAR_MS), self.NOW
+            )
+            self.assertIn("future", problem)
+
+    def test_a_hole_in_the_series_is_refused(self) -> None:
+        with scratch_dir() as d:
+            engine = self._engine(d)
+            series = self._series(self.NOW - self.BAR_MS)
+            series[50].ts_ms += self.BAR_MS * 3  # a three-bar hole
+            self.assertIn("gap in the series", engine._candle_series_problem(series, self.NOW))
+
+    def test_history_older_than_the_window_is_refused(self) -> None:
+        """Gluing history older than the window onto the live feed leaves the whole
+        warm-up stale, so the operator is told to re-fetch instead."""
+        with scratch_dir() as d:
+            engine = self._engine(d)
+            last = self.NOW - (SEED_MAX_GAP_BARS + 3) * self.BAR_MS
+            problem = engine._candle_series_problem(self._series(last), self.NOW)
+            self.assertIn("bars ago", problem)
+            self.assertIn("fetch_history.py", problem)
 
 
 if __name__ == "__main__":
