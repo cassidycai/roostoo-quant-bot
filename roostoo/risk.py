@@ -283,6 +283,27 @@ class PositionBook:
             # Unreadable or corrupt: treat it as non-empty so we never clobber it.
             return True
 
+    def _scope_mismatch(self, payload: Any) -> Optional[tuple[str, str]]:
+        """``(written_by, this_process)`` when the file belongs to another runtime.
+
+        A file with no stamp is accepted: state written before this check existed
+        has to keep working, and the first run after the upgrade re-stamps it.
+        Only an explicit contradiction is refused, because that is the case where
+        adopting the contents would be wrong rather than merely incomplete.
+        """
+        if self.cfg is None or not isinstance(payload, dict):
+            return None
+        saved = payload.get("scope")
+        if not isinstance(saved, dict):
+            return None
+        current = self.cfg.state_scope
+        if all(saved.get(key) == current[key] for key in current):
+            return None
+        return (
+            f"{saved.get('mode', '?')}@{saved.get('venue', '?')}",
+            f"{current['mode']}@{current['venue']}",
+        )
+
     def save(self) -> None:
         if not self.path:
             return
@@ -303,7 +324,13 @@ class PositionBook:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp.write_text(json.dumps(self.to_dict(), indent=2, allow_nan=False), encoding="utf-8")
+            payload = self.to_dict()
+            # Stamp which runtime wrote this. mock and live share the default
+            # journal directory, so without the stamp a simulated book is
+            # indistinguishable from a real one. See Config.state_scope.
+            if self.cfg is not None:
+                payload["scope"] = self.cfg.state_scope
+            tmp.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
             tmp.replace(self.path)  # atomic: never leave a half-written state file
         except Exception as exc:
             log.error("could not persist position book: %s", exc)
@@ -315,6 +342,19 @@ class PositionBook:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except Exception as exc:
             log.error("could not read position book (%s); starting flat", exc)
+            return False
+        mismatch = self._scope_mismatch(payload)
+        if mismatch is not None:
+            saved, current = mismatch
+            log.error(
+                "refusing to load the position book at %s: it was written by %s, this "
+                "process is %s. Starting flat so one venue's positions and stops are not "
+                "adopted by another. Point JOURNAL_DIR elsewhere, or delete the file, if "
+                "switching venues is what you intended.",
+                self.path, saved, current,
+            )
+            self.positions = {}
+            self._load_attempted = True  # we did look; a flat book may now replace it
             return False
         self.positions = {}
         for pair, row in (payload.get("positions") or {}).items():

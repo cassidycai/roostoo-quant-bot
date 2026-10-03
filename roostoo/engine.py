@@ -131,6 +131,11 @@ class TradingEngine:
         #: ``pair -> (bar placed, limit price)``. Only used to cancel stale ones.
         self._resting: dict[str, tuple[int, float]] = {}
         self._shutting_down = False
+        #: The halt journal entry is written once per run, not once per cycle:
+        #: a halted engine keeps looping until its book is flat (see `step`).
+        self._halt_announced = False
+        #: Consecutive cycles that ended with positions still open after a halt.
+        self._halt_flatten_failures = 0
         #: Gate for ``_persist()``. Stays False until ``bootstrap()`` has
         #: completed, so a startup failure can never overwrite stored state.
         self._ready = False
@@ -290,12 +295,50 @@ class TradingEngine:
 
         self.journal.cycle(current_bar, now_ms, nav, cash_usd, depth=depth_dump)
 
-        # --- kill switch: flatten and stop -------------------------------
+        # --- kill switch: stop opening, then work the book flat -----------
+        # "Halted" is not "finished". Flattening can fail -- a rejected sell, a
+        # venue outage, a mark that cannot be priced -- and the exit status tells
+        # systemd this is a clean stop, so a process that exits anyway leaves the
+        # remaining position with nothing managing it and nobody restarting it.
+        # The loop therefore keeps running and retrying until the book is
+        # genuinely empty; only then is the run over. No entry can happen in the
+        # meantime, because this branch returns before any of the logic below.
         if self.risk.halted:
-            self.journal.halt(now_ms, self.risk.halt_reason, nav=round(nav, 4))
+            if not self._halt_announced:
+                self.journal.halt(now_ms, self.risk.halt_reason, nav=round(nav, 4))
+                self._halt_announced = True
+            if not self.book.held():
+                self._halt_flatten_failures = 0
+                self._persist()
+                self._shutting_down = True
+                return
+            # Cancel resting entries first: a stale bid must not fill into a book
+            # that is being liquidated, and cancelling frees the slot it holds.
+            self._expire_resting_orders(now_ms, current_bar)
             self._flatten(now_ms, reason=self.risk.halt_reason)
+            remaining = self.book.held()
+            if not remaining:
+                self._halt_flatten_failures = 0
+            else:
+                self._halt_flatten_failures += 1
+                # Log the first failure and then every tenth, so a venue outage
+                # over a 14-day run is visible without filling the disk.
+                if self._halt_flatten_failures == 1 or self._halt_flatten_failures % 10 == 0:
+                    log.error(
+                        "halted with %d position(s) still open (%s); retrying the flatten and "
+                        "NOT exiting, because the exit status tells systemd not to restart "
+                        "(attempt %d)",
+                        len(remaining),
+                        ", ".join(sorted(remaining)),
+                        self._halt_flatten_failures,
+                    )
+                    self.journal.event(
+                        "halt_flatten_incomplete",
+                        attempts=self._halt_flatten_failures,
+                        remaining=sorted(remaining),
+                        reason=self.risk.halt_reason,
+                    )
             self._persist()
-            self._shutting_down = True
             return
 
         # --- stale maker entries are released before new ones are posted -----
@@ -631,7 +674,7 @@ class TradingEngine:
             self._adopt_unknown_short(short)
 
     def _adopt_unknown_short(self, short: Any) -> None:
-        """恢复交易所空头，保留真实开仓时间和本地止损。"""
+        """Adopt a venue-held short, keeping the real open time and the local stop."""
         pair = getattr(short, "pair", "")
         quantity = float(getattr(short, "quantity", 0.0) or 0.0)
         if not pair or not math.isfinite(quantity) or quantity <= 0:
@@ -651,7 +694,7 @@ class TradingEngine:
 
         position = self.book.get(pair)
 
-        # 已有空头：同步交易所字段，保留原有止损。
+        # Already short: sync the venue's fields, keep the local stop.
         if position is not None and position.is_short:
             before = {
                 "quantity": position.quantity,
@@ -685,7 +728,7 @@ class TradingEngine:
                 )
             return
 
-        # 同一币对已有多头，不能直接用空头覆盖。
+        # The book already holds a long for this pair; a short must not overwrite it.
         if position is not None:
             log.error(
                 "%s: venue reports a short while the book holds a long",
@@ -696,7 +739,7 @@ class TradingEngine:
             )
             return
 
-        # 新恢复的空头：使用交易所开仓时间。
+        # Newly adopted short: take the venue's open time.
         if not math.isfinite(entry) or entry <= 0:
             ticker = self.tickers.get(pair)
             entry = ticker.mid if ticker is not None else 0.0
@@ -1128,6 +1171,11 @@ class TradingEngine:
     def _state_path(self) -> Path:
         return Path(self.cfg.journal_dir) / "engine_state.json"
 
+    def _scope_matches(self, saved: dict[str, Any]) -> bool:
+        """Does a state file's stamp match this process? See Config.state_scope."""
+        current = self.cfg.state_scope
+        return all(saved.get(key) == current[key] for key in current)
+
     def _load_risk_state(self) -> None:
         path = self._state_path()
         if not path.is_file():
@@ -1138,6 +1186,27 @@ class TradingEngine:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError(f"state file is a {type(payload).__name__}, not an object")
+            saved_scope = payload.get("scope")
+            if isinstance(saved_scope, dict) and not self._scope_matches(saved_scope):
+                # Another runtime's state: a mock file read by a live process, or a
+                # different venue. Adopting it would import a simulated drawdown
+                # high-water mark, a simulated halt, or another venue's cooldowns
+                # into live. Start from defaults, say so, and let the first good
+                # cycle re-stamp the file.
+                current = self.cfg.state_scope
+                log.error(
+                    "engine state at %s belongs to %s@%s but this process is %s@%s; "
+                    "ignoring the stored risk state and halt flags",
+                    path,
+                    saved_scope.get("mode"), saved_scope.get("venue"),
+                    current["mode"], current["venue"],
+                )
+                self.journal.event(
+                    "state_scope_mismatch", saved=saved_scope, current=current
+                )
+                self.risk.restore({})
+                self._last_decision_bar = None
+                return
             risk_payload = payload.get("risk") or {}
             if not isinstance(risk_payload, dict):
                 raise ValueError(f"risk state is a {type(risk_payload).__name__}, not an object")
@@ -1174,6 +1243,9 @@ class TradingEngine:
         try:
             payload = {
                 "saved_ms": int(time.time() * 1000),
+                # Which runtime wrote this. Without it, a mock-written file is
+                # indistinguishable from a live one and gets loaded by both.
+                "scope": self.cfg.state_scope,
                 "risk": self.risk.snapshot(),
                 "last_decision_bar": self._last_decision_bar,
                 "stats": self.stats.to_dict(),

@@ -589,6 +589,114 @@ class TestTextEncodingGuard(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+class TestStateScopeIsolation(unittest.TestCase):
+    """mock and live share the default journal directory.
+
+    A state file therefore has to record which runtime wrote it. Without that, a
+    simulated book -- positions, stop levels, the drawdown high-water mark, a
+    simulated halt -- is indistinguishable from a real one and is adopted by live.
+    A file written before the stamp existed is still accepted, because refusing it
+    on an upgrade would strand real positions without their stops; only an
+    explicit contradiction is refused.
+    """
+
+    @staticmethod
+    def _write_scoped(path: Path, scope: dict[str, str]) -> None:
+        write_book(path, {PAIR: book_fixture()})
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["scope"] = scope
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_scope_names_the_mode_and_the_venue(self) -> None:
+        with scratch_dir() as d:
+            cfg = make_config(d)  # make_config sets mock = True
+            self.assertEqual(cfg.state_scope["mode"], "mock")
+            cfg.mock = False
+            cfg.base_url = "https://api.example.com"
+            self.assertEqual(
+                cfg.state_scope, {"mode": "live", "venue": "https://api.example.com"}
+            )
+
+    def test_a_mock_book_is_refused_by_a_live_process(self) -> None:
+        with scratch_dir() as d:
+            path = d / "positions.json"
+            self._write_scoped(path, {"mode": "mock", "venue": "https://mock-api.roostoo.com"})
+            cfg = make_config(d)
+            cfg.mock = False
+            cfg.base_url = "https://mock-api.roostoo.com"
+            book = PositionBook(path, cfg=cfg)
+            self.assertFalse(book.load(), "live adopted a simulated book")
+            self.assertEqual(book.positions, {})
+
+    def test_a_second_live_venue_is_refused_too(self) -> None:
+        """The test venue and the competition venue are both 'live', so mode alone
+        is not enough to identify whose stops these are."""
+        with scratch_dir() as d:
+            path = d / "positions.json"
+            self._write_scoped(path, {"mode": "live", "venue": "https://mock-api.roostoo.com"})
+            cfg = make_config(d)
+            cfg.mock = False
+            cfg.base_url = "https://competition.example.com"
+            book = PositionBook(path, cfg=cfg)
+            self.assertFalse(book.load())
+            self.assertEqual(book.positions, {})
+
+    def test_the_matching_scope_loads(self) -> None:
+        with scratch_dir() as d:
+            path = d / "positions.json"
+            cfg = make_config(d)
+            cfg.mock = False
+            self._write_scoped(path, cfg.state_scope)
+            book = PositionBook(path, cfg=cfg)
+            self.assertTrue(book.load())
+            self.assertIn(PAIR, book.positions)
+
+    def test_an_unstamped_book_still_loads(self) -> None:
+        with scratch_dir() as d:
+            path = d / "positions.json"
+            write_book(path, {PAIR: book_fixture()})
+            cfg = make_config(d)
+            book = PositionBook(path, cfg=cfg)
+            self.assertTrue(book.load())
+            self.assertIn(PAIR, book.positions)
+
+    def test_a_refused_book_can_still_be_replaced(self) -> None:
+        """Refusing to load is not refusing to save. If the stale file could not be
+        overwritten, the wrong-venue state would sit there forever."""
+        with scratch_dir() as d:
+            path = d / "positions.json"
+            self._write_scoped(path, {"mode": "mock", "venue": "elsewhere"})
+            cfg = make_config(d)
+            cfg.mock = False
+            book = PositionBook(path, cfg=cfg)
+            self.assertFalse(book.load())
+            book.save()
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("scope"), cfg.state_scope)
+            self.assertEqual(payload["positions"], {})
+
+    def test_a_book_without_a_config_is_unaffected(self) -> None:
+        """Tests and tools construct PositionBook(path) with no cfg; the check must
+        not fire for them."""
+        with scratch_dir() as d:
+            path = d / "positions.json"
+            self._write_scoped(path, {"mode": "mock", "venue": "elsewhere"})
+            book = PositionBook(path)
+            self.assertTrue(book.load())
+
+    def test_the_engine_scope_gate(self) -> None:
+        with scratch_dir() as d:
+            cfg = make_config(d)  # mock
+            engine = mock.MagicMock(cfg=cfg)
+            self.assertTrue(TradingEngine._scope_matches(engine, cfg.state_scope))
+            self.assertFalse(
+                TradingEngine._scope_matches(
+                    engine, {"mode": "live", "venue": cfg.base_url}
+                )
+            )
+
+
+# ---------------------------------------------------------------------------
 class TestLimitEntries(unittest.TestCase):
     """Maker entries: post a resting bid, and cancel it if it goes stale.
 
@@ -1250,6 +1358,128 @@ class TestAHaltedRunStopsCleanlyInsteadOfRestarting(unittest.TestCase):
 
             self.assertEqual(status, run_live.HALTED_EXIT_STATUS, "a halted run must not report success")
             captured["engine"].journal.close()
+
+
+class HaltClient:
+    """A usable venue whose sell orders are rejected, so a flatten cannot finish."""
+
+    def __init__(self, hold: bool = True) -> None:
+        self.orders: list = []
+        #: Whether the venue still reports the coin. Reconciliation re-adopts from
+        #: this, so clearing the local book is not enough to make it flat.
+        self.hold = hold
+
+    def sync_time(self) -> int:
+        return 0
+
+    def exchange_info(self) -> ExchangeInfo:
+        return ExchangeInfo(is_running=True, initial_wallet={"USD": 100_000.0}, pairs={PAIR: trade_pair()})
+
+    def ticker(self, pair: str | None = None) -> dict:
+        return {PAIR: ticker(PAIR)}
+
+    def balance(self) -> dict:
+        # An *explicit* zero closes a position; a missing row never does.
+        return {
+            "USD": WalletBalance(asset="USD", free=100_000.0, locked=0.0),
+            "BTC": WalletBalance(asset="BTC", free=0.5 if self.hold else 0.0, locked=0.0),
+        }
+
+    def pending_count(self) -> tuple[int, dict]:
+        return 0, {}
+
+    def place_order(self, *args, **kwargs):
+        self.orders.append((args, kwargs))
+        # The venue refuses to sell. The position must therefore survive.
+        return OrderResult(
+            pair=PAIR, side="SELL", order_type="MARKET", quantity=0.5,
+            price=0.0, status="REJECTED", err_msg="insufficient balance",
+        )
+
+    def query_orders(self, **kwargs) -> list:
+        return []
+
+    def cancel_order(self, *args, **kwargs) -> list:
+        return []
+
+    def short_positions(self) -> list:
+        return []
+
+
+class TestHaltDoesNotAbandonOpenPositions(unittest.TestCase):
+    """A halted engine must not walk away from an open position.
+
+    `run_live` exits with HALTED_EXIT_STATUS and the systemd unit declares that
+    status a clean stop with `RestartPreventExitStatus`, so a process that exits
+    while a flatten is incomplete leaves the position with nothing managing it and
+    nothing that will restart it. An unattended 14-day run cannot do that.
+    """
+
+    def _engine(self, directory: Path, hold: bool = True) -> TradingEngine:
+        engine = TradingEngine(make_config(directory), client=HaltClient(hold=hold))
+        self.addCleanup(engine.journal.close)
+        engine.exchange_pairs = {PAIR: trade_pair()}
+        engine._ready = True  # bootstrap is not under test here
+        engine.risk.halted = True
+        engine.risk.halt_reason = "drawdown 25.00% >= 20.00% of peak NAV"
+        engine.book.positions[PAIR] = Position(
+            pair=PAIR, quantity=0.5, avg_price=60_000.0, mark_price=61_000.0, stop_price=57_000.0
+        )
+        return engine
+
+    def test_it_keeps_running_while_a_position_is_open(self) -> None:
+        with scratch_dir() as d:
+            engine = self._engine(d)
+            engine.step()
+
+            self.assertIn(PAIR, engine.book.positions, "the refused sell closed the position")
+            self.assertFalse(
+                engine._shutting_down,
+                "the engine ended the run with a position still open and unsupervised",
+            )
+
+    def test_it_ends_the_run_once_the_book_is_flat(self) -> None:
+        with scratch_dir() as d:
+            engine = self._engine(d, hold=False)  # the venue reports an explicit zero
+            engine.step()
+
+            self.assertEqual(engine.book.held(), {})
+            self.assertTrue(engine._shutting_down, "a flat book after a halt must end the run")
+
+    def test_the_halt_is_announced_once_per_run(self) -> None:
+        """The engine now loops while halted, so an unguarded journal.halt() would
+        write one entry per cycle for the life of the process."""
+        with scratch_dir() as d:
+            engine = self._engine(d)
+            calls: list = []
+            real = engine.journal.halt
+            engine.journal.halt = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+
+            engine.step()
+            engine.step()
+
+            self.assertEqual(len(calls), 1, "the halt was journalled on every cycle")
+
+    def test_incomplete_flattens_are_counted(self) -> None:
+        with scratch_dir() as d:
+            engine = self._engine(d)
+            engine.step()
+            engine.step()
+
+            self.assertEqual(engine._halt_flatten_failures, 2)
+
+    def test_the_failure_count_resets_once_the_book_is_flat(self) -> None:
+        with scratch_dir() as d:
+            engine = self._engine(d)
+            engine.step()
+            self.assertEqual(engine._halt_flatten_failures, 1)
+
+            engine.client.hold = False  # the position finally leaves the venue
+            engine.step()
+
+            self.assertEqual(engine.book.held(), {})
+            self.assertEqual(engine._halt_flatten_failures, 0)
+            self.assertTrue(engine._shutting_down)
 
 
 if __name__ == "__main__":

@@ -166,10 +166,11 @@ no plateau to find. Any tuning that only looks good in-sample is noise.
 
 Two cautions on reading that band. It is bounded below by the ±10 reporting clamp,
 which saturates rather than scales, so configurations that differ in reality can
-print the same composite. And the OOS window is only **30 days** (1,441 bars of
-the 5,761), too short to conclude anything about regime robustness. Re-run on
-6–12 months and check the result holds in both a rising and a falling market
-before committing.
+print the same composite. And the OOS window in those runs is only **30 days**
+(1,441 bars of the 5,761), because that is how long the dataset was, which is too
+short to conclude anything about regime robustness. `data/` now holds **365 days
+for all ten tradable pairs**, so re-run it and check that the result holds in both
+a rising and a falling market before committing.
 
 ## 6. What to change first, in order of expected impact
 
@@ -360,9 +361,12 @@ confirm the real rate in the live journal before relying on it.
 Rule 2's entry can be read two ways, and the code now makes the choice explicit
 through `direction` instead of leaving it implicit in a sign.
 
-**The repo's own `data/` is only ~120 days, which is too short to settle this.**
-The table below uses a 2-year dataset (35,042 x 30m bars, 10 pairs) and holds out
-the final 183 days, so the out-of-sample column is comparable across rows.
+**`data/` now carries 365 days for every tradable pair, which is enough to re-run
+this at one year.** The table below was produced from a 2-year dataset (35,042 x
+30m bars, 10 pairs) and holds out the final 183 days, so the out-of-sample column
+is comparable across rows. Market data is git-ignored, so that particular set is
+not in the repository; `scripts/fetch_history.py --days 730` regenerates an
+equivalent one.
 
 | policy | IS | OOS (183 days) | IS drawdown | round trips (IS/OOS) |
 |---|---|---|---|---|

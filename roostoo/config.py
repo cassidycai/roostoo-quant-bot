@@ -371,6 +371,20 @@ class Config:
                 raise ConfigError(f"{name} must be in (0, 1]")
 
     # ------------------------------------------------------------------
+    @property
+    def state_scope(self) -> dict[str, str]:
+        """Identifies which runtime wrote a persisted state file.
+
+        ``mock`` and ``live`` share the default journal directory, so without this
+        a simulated book can be adopted by a live process: simulated positions, a
+        simulated drawdown high-water mark, or a simulated halt, all read as real.
+
+        Mode alone is not enough to identify a venue -- the test venue and the
+        competition venue are both "live" -- so the base URL is part of the
+        identity. Two different live venues must not inherit each other's stops.
+        """
+        return {"mode": "mock" if self.mock else "live", "venue": self.base_url}
+
     def resolved_pairs(self) -> tuple[str, ...]:
         """Explicit universe, normalised to ``BASE/QUOTE`` form."""
         out = []

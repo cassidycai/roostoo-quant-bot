@@ -21,9 +21,13 @@ window) about three things this repo cannot answer:
 
 * whether an **order-book depth endpoint** exists (the public docs have none —
   the `available_sub` socket.io block is commented out), because Rule 1's
-  "depth within ±0.5% > $X" depends on it;
-* whether **short positions** are enabled for the competition (the v6 endpoints
-  document an error string `this competition does not allow short positions`).
+  "depth within ±0.5% > $X" depends on it.
+
+**Already answered:** **short positions are permitted** — confirmed with the
+organisers. The v6 endpoint error string `this competition does not allow short
+positions` is stale documentation, so `allow_short` stays at its default of true
+and the short leg is expected to run. `python3 run_live.py --check` verifies the
+short endpoints respond before the competition window.
 
 **Already answered:** the mock venue's prices **track Binance**. That is why
 Binance klines are valid research data here and why Binance's L2 book can stand in
