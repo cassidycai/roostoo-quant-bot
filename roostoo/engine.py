@@ -107,6 +107,11 @@ class TradingEngine:
         self.client = client or build_client(cfg)
         self.journal = journal if journal is not None else Journal(cfg.journal_dir)
         self.strategy = load_strategy(cfg.strategy, cfg.strategy_params)
+       
+        configure = getattr(self.strategy, "configure_execution", None)
+        if configure is not None:
+           configure(cfg)
+           
         self.stats = EngineStats()
 
         self.exchange_pairs: dict[str, TradePair] = {}
